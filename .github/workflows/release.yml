@@ -1,0 +1,98 @@
+name: Release
+
+# Trigger: push a tag like v0.1.0 → build & publish GitHub Release.
+# The tauri.conf.json / Cargo.toml / package.json version must match the tag
+# (e.g. tag v0.1.0 ↔ version 0.1.0).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - windows-latest # NSIS + MSI installers
+        # macOS: uncomment after verifying spawn_harness on macOS (the POSIX
+        # branch runs `dsh` from PATH directly) and setting up signing/notarization.
+        #   - macos-latest
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux-only system deps (needed if you add ubuntu-latest to the matrix).
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # The workspace has no frontend build step (src/index.html is a static
+      # placeholder; the harness URL is loaded at runtime), so nothing to
+      # bundle before tauri build.
+
+      - name: Build & Publish Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Installer/updater signing. Add the private key as a repository
+          # secret `TAURI_SIGNING_PRIVATE_KEY` (value: the full private key
+          # string from `.tauri/deepseek-harness.key`). The key is passwordless
+          # (generated with an empty password), so the password env var must be
+          # set to an empty string — otherwise the CLI waits for an interactive
+          # prompt and the CI build hangs.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DeepSeek-Harness ${{ github.ref_name }}"
+          releaseBody: |
+            DeepSeek-Harness — DeepSeek Harness 的 Tauri 桌面壳。
+
+            ## 安装
+
+            - Windows: `DeepSeek-Harness_<version>_x64-setup.exe`（NSIS 安装包）或 `.msi`
+            - 免安装版：`deepseek-harness.exe`（双击即用）
+
+            > 目标机器需 **Node >= 22** 和全局 **`@deepseek-ai/dsh`**：
+            > `npm install -g @deepseek-ai/dsh`
+            >
+            > 配置/会话与命令行 dsh 共享（`$DSH_HOME` 或 `~/.dsh`）。
+          releaseDraft: true
+          prerelease: false

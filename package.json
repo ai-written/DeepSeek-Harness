@@ -1,0 +1,15 @@
+{
+  "name": "deepseek-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek-Harness — Tauri desktop shell embedding the DeepSeek Harness web UI",
+  "scripts": {
+    "icon": "node scripts/make-ico.mjs",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "sharp": "^0.35.3"
+  }
+}
