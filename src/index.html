@@ -2,76 +2,358 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'" />
+  <!-- style-src 'unsafe-inline' is required: the placeholder page styles and
+       the injected titlebar (window-controls.js) both use inline <style> and
+       style attributes. No user input ever reaches these styles, so this does
+       not introduce an injection surface. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'" />
   <title>DeepSeek-Harness</title>
   <style>
+    :root {
+      --bg: #f6f8fa;
+      --accent: #1f6feb;
+      --accent-2: #388bfd;
+      --ok: #2da44e;
+      --err: #cf222e;
+      --text: #1f2328;
+      --muted: #57606a;
+      --faint: #8b949e;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
+    }
+
     body {
       margin: 0;
-      height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      background: #0f1115;
-      color: #8b949e;
-      font-family: system-ui, sans-serif;
+      overflow: hidden;
+      background:
+        radial-gradient(1100px 650px at 50% -12%, rgba(31, 111, 235, 0.10), transparent 62%),
+        radial-gradient(900px 560px at 88% 112%, rgba(45, 164, 78, 0.06), transparent 60%),
+        radial-gradient(700px 500px at 6% 108%, rgba(219, 122, 39, 0.05), transparent 60%),
+        var(--bg);
+      color: var(--muted);
+      font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
       font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Slow ambient drift behind everything. */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -30%;
+      background:
+        radial-gradient(460px 460px at 32% 30%, rgba(31, 111, 235, 0.08), transparent 62%),
+        radial-gradient(380px 380px at 68% 62%, rgba(45, 164, 78, 0.05), transparent 62%);
+      animation: drift 16s ease-in-out infinite alternate;
+      pointer-events: none;
+    }
+
+    @keyframes drift {
+      from {
+        transform: translate3d(-1.5%, -1%, 0) rotate(0deg);
+      }
+      to {
+        transform: translate3d(1.5%, 1%, 0) rotate(5deg);
+      }
     }
 
     .panel {
+      position: relative;
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 14px;
-      max-width: 520px;
-      padding: 0 24px;
+      gap: 10px;
+      max-width: 560px;
+      padding: 0 32px;
       text-align: center;
+      animation: panel-in 0.5s ease both;
     }
 
-    /* Pure-CSS spinner — no inline script needed (CSP default-src 'self'). */
-    .spinner {
-      width: 36px;
-      height: 36px;
-      border: 3px solid rgba(139, 148, 158, 0.25);
-      border-top-color: #4da3ff;
-      border-radius: 50%;
-      animation: spin 0.9s linear infinite;
+    @keyframes panel-in {
+      from {
+        opacity: 0;
+        transform: translateY(10px) scale(0.98);
+      }
+      to {
+        opacity: 1;
+        transform: none;
+      }
     }
 
-    @keyframes spin {
-      to { transform: rotate(360deg); }
+    .logo {
+      filter: drop-shadow(0 8px 26px rgba(31, 111, 235, 0.25));
+      animation: logo-pulse 2.6s ease-in-out infinite;
+      transition: filter 0.4s ease;
+    }
+
+    @keyframes logo-pulse {
+      0%,
+      100% {
+        transform: scale(1);
+      }
+      50% {
+        transform: scale(1.04);
+      }
+    }
+
+    /* On failure the logo glow turns red to match the error status. */
+    .panel.has-error .logo {
+      filter: drop-shadow(0 8px 26px rgba(207, 34, 46, 0.25));
+      animation: none;
     }
 
     .title {
-      color: #e6edf3;
-      font-size: 16px;
+      margin: 16px 0 0;
+      color: var(--text);
+      font-size: 21px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .subtitle {
+      margin: 0;
+      font-size: 12.5px;
+      color: var(--faint);
+      letter-spacing: 0.3px;
+    }
+
+    /* Step indicator: three dots with connecting lines, driven by the
+       dsh-startup stages (locate → wait → ready) from window-controls.js. */
+    .steps {
+      display: flex;
+      align-items: flex-start;
+      width: 100%;
+      max-width: 420px;
+      margin-top: 26px;
+    }
+
+    .step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 9px;
+      width: 108px;
+    }
+
+    .step-dot {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 2px solid rgba(87, 96, 106, 0.35);
+      background: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: border-color 0.3s ease, background 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .step-dot .icon-check,
+    .step-dot .icon-alert {
+      display: none;
+      color: #fff;
+    }
+
+    .step-label {
+      font-size: 12px;
+      color: var(--faint);
+      transition: color 0.3s ease, font-weight 0.3s ease;
+    }
+
+    /* Done: green dot with a white check. */
+    .step.is-done .step-dot {
+      border-color: var(--ok);
+      background: var(--ok);
+      box-shadow: 0 0 14px rgba(45, 164, 78, 0.35);
+    }
+    .step.is-done .step-dot .icon-check {
+      display: block;
+    }
+    .step.is-done .step-label {
+      color: var(--muted);
+    }
+
+    /* Active: spinning ring in the accent color. */
+    .step.is-active .step-dot {
+      border-color: var(--accent);
+      border-top-color: transparent;
+      box-shadow: 0 0 12px rgba(31, 111, 235, 0.25);
+      animation: step-spin 0.9s linear infinite;
+    }
+    .step.is-active .step-label {
+      color: var(--accent);
       font-weight: 600;
+    }
+
+    /* Error: red dot with a white alert icon. */
+    .step.is-error .step-dot {
+      border-color: var(--err);
+      background: var(--err);
+      box-shadow: 0 0 14px rgba(207, 34, 46, 0.35);
+    }
+    .step.is-error .step-dot .icon-alert {
+      display: block;
+    }
+    .step.is-error .step-label {
+      color: var(--err);
+      font-weight: 600;
+    }
+
+    @keyframes step-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    .step-line {
+      flex: 1;
+      height: 2px;
+      border-radius: 2px;
+      background: rgba(87, 96, 106, 0.18);
+      margin-top: 10px;
+      transition: background 0.3s ease;
+    }
+
+    .step-line.is-done {
+      background: var(--ok);
     }
 
     /* Live status, updated by window-controls.js from the dsh-startup event. */
     .status {
+      margin-top: 4px;
+      min-height: 22px;
       font-size: 13px;
-      color: #8b949e;
-      line-height: 1.6;
+      color: var(--muted);
+      line-height: 1.7;
+      white-space: pre-line;
+      animation: status-in 0.35s ease;
+    }
+
+    @keyframes status-in {
+      from {
+        opacity: 0;
+        transform: translateY(3px);
+      }
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    /* "服务已就绪，正在加载界面…": accent text plus a small inline spinner. */
+    .status.ready {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .status.ready::after {
+      content: "";
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(31, 111, 235, 0.25);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      margin-left: 9px;
+      vertical-align: -2px;
+      animation: step-spin 0.8s linear infinite;
     }
 
     .status.error {
-      color: #f85149;
+      color: var(--err);
       font-weight: 600;
     }
 
     .hint {
+      margin-top: 14px;
+      max-width: 500px;
       font-size: 12px;
-      color: #6e7681;
-      line-height: 1.6;
+      color: var(--faint);
+      line-height: 1.8;
+    }
+
+    .hint code {
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--muted);
+      background: rgba(87, 96, 106, 0.12);
+      padding: 1px 6px;
+      border-radius: 4px;
     }
   </style>
 </head>
 <body>
-  <div class="panel">
-    <div class="spinner"></div>
-    <div class="title">正在启动 DeepSeek Harness…</div>
-    <div id="dsh-startup-status" class="status">正在定位 dsh…</div>
-    <div class="hint">首次开机启动可能较慢：需要冷启动 dsh 服务和 WebView 运行时，请耐心等待。</div>
+  <div class="panel" id="startup-panel">
+    <div class="logo">
+      <svg width="64" height="64" viewBox="0 0 64 64" aria-hidden="true">
+        <defs>
+          <linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#54aeff" />
+            <stop offset="1" stop-color="#1f6feb" />
+          </linearGradient>
+        </defs>
+        <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#logo-g)" />
+        <path d="M32 19v13l9 9" stroke="#fff" stroke-width="4" stroke-linecap="round" fill="none" />
+        <circle cx="32" cy="32" r="16" stroke="rgba(255,255,255,0.45)" stroke-width="2" fill="none" />
+        <circle cx="32" cy="32" r="6" fill="#fff" />
+      </svg>
+    </div>
+    <h1 class="title">DeepSeek Harness</h1>
+    <p class="subtitle">正在为您准备开发环境</p>
+
+    <div class="steps" id="startup-steps">
+      <div class="step is-active" data-step="1">
+        <div class="step-dot">
+          <svg class="icon-check" width="11" height="11" viewBox="0 0 12 12">
+            <path d="M2 6.2 4.8 9 10 3.5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <svg class="icon-alert" width="11" height="11" viewBox="0 0 12 12">
+            <path d="M6 2.2v4.6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" />
+            <circle cx="6" cy="9.4" r="0.9" fill="currentColor" />
+          </svg>
+        </div>
+        <div class="step-label">启动服务</div>
+      </div>
+      <div class="step-line"></div>
+      <div class="step" data-step="2">
+        <div class="step-dot">
+          <svg class="icon-check" width="11" height="11" viewBox="0 0 12 12">
+            <path d="M2 6.2 4.8 9 10 3.5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <svg class="icon-alert" width="11" height="11" viewBox="0 0 12 12">
+            <path d="M6 2.2v4.6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" />
+            <circle cx="6" cy="9.4" r="0.9" fill="currentColor" />
+          </svg>
+        </div>
+        <div class="step-label">等待就绪</div>
+      </div>
+      <div class="step-line"></div>
+      <div class="step" data-step="3">
+        <div class="step-dot">
+          <svg class="icon-check" width="11" height="11" viewBox="0 0 12 12">
+            <path d="M2 6.2 4.8 9 10 3.5" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <svg class="icon-alert" width="11" height="11" viewBox="0 0 12 12">
+            <path d="M6 2.2v4.6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" />
+            <circle cx="6" cy="9.4" r="0.9" fill="currentColor" />
+          </svg>
+        </div>
+        <div class="step-label">加载界面</div>
+      </div>
+    </div>
+
+    <div id="dsh-startup-status" class="status" role="status">正在定位 dsh…</div>
+
+    <p class="hint">首次开机启动可能较慢：需要冷启动 dsh 服务和 WebView 运行时，请耐心等待。<br />若启动失败，详细日志见：<code>%LOCALAPPDATA%\deepseek-harness\startup.log</code></p>
   </div>
 </body>
 </html>

@@ -6,7 +6,8 @@
   "scripts": {
     "icon": "node scripts/make-ico.mjs",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "build": "node scripts/build.mjs",
+    "tauri": "tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

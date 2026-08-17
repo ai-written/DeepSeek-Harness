@@ -29,6 +29,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Fail fast (before any toolchain/build work) with a clear message when
+      # the updater signing secret is missing or malformed. Without it
+      # tauri-action builds with an empty TAURI_SIGNING_PRIVATE_KEY and fails
+      # deep inside the bundler (or hangs waiting for a key), which is painful
+      # to debug. Step-level `if` cannot read the `secrets` context, so the
+      # value is passed through `env` and checked in the script instead.
+      - name: Check TAURI_SIGNING_PRIVATE_KEY secret is configured
+        shell: pwsh
+        env:
+          DSH_SIGN_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          $key = $env:DSH_SIGN_KEY
+          if ([string]::IsNullOrEmpty($key)) {
+            Write-Error "❌ Missing secret: TAURI_SIGNING_PRIVATE_KEY 未配置，无法构建更新包。`n`n修复：`n  1. 打开仓库 Settings → Secrets and variables → Actions → New repository secret。`n  2. Name 填 TAURI_SIGNING_PRIVATE_KEY。`n  3. Value 填本机 .tauri\deepseek-harness.key 的完整内容（Get-Content .tauri\deepseek-harness.key -Raw），私钥勿外泄。"
+            exit 1
+          }
+          # A minisign secret key is a ~460-char base64 blob; tolerate
+          # surrounding whitespace (e.g. a trailing newline from -Raw).
+          $trimmed = $key.Trim()
+          if ($trimmed.Length -lt 100 -or $trimmed -match '[^A-Za-z0-9+/=]') {
+            Write-Error "TAURI_SIGNING_PRIVATE_KEY 内容看起来不是有效的 minisign 私钥（长度 $($trimmed.Length)）。请用 .tauri\deepseek-harness.key 的完整内容重新配置。"
+            exit 1
+          }
+          Write-Host "TAURI_SIGNING_PRIVATE_KEY looks OK (length $($trimmed.Length))."
+
       # Linux-only system deps (needed if you add ubuntu-latest to the matrix).
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-latest'
@@ -88,11 +113,41 @@ jobs:
             ## 安装
 
             - Windows: `DeepSeek-Harness_<version>_x64-setup.exe`（NSIS 安装包）或 `.msi`
-            - 免安装版：`deepseek-harness.exe`（双击即用）
+            - 免安装版：`DeepSeek-Harness_<version>_x64-portable.exe`（双击即用）
+
+            > **免安装版首次运行**：若双击后无任何反应（无窗口/无进程），是因为下载文件带"来自互联网"标记、且无代码签名被 SmartScreen 拦截。请右键 exe → 属性 → 勾选 **解除锁定** → 确定，再双击；或 PowerShell 执行 `Unblock-File`。命令行方式运行不受影响。
 
             > 目标机器需 **Node >= 22** 和全局 **`@deepseek-ai/dsh`**：
             > `npm install -g @deepseek-ai/dsh`
             >
             > 配置/会话与命令行 dsh 共享（`$DSH_HOME` 或 `~/.dsh`）。
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
+
+      # The standalone (免安装) binary at src-tauri/target/release/
+      # deepseek-harness.exe lives OUTSIDE the bundler output, so tauri-action
+      # does not upload it (it only publishes files under bundle/). Stage a
+      # copy into the bundle dir and add it to the same release as an extra
+      # asset.
+      # Name the portable asset from the project version
+      # (src-tauri/tauri.conf.json) so it matches the NSIS/MSI artifact names —
+      # NOT from the tag, which can drift (e.g. tag v0.0.1 while the project
+      # is 0.1.0).
+      - name: Resolve project version
+        id: version
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri\tauri.conf.json -Raw | ConvertFrom-Json
+          Write-Output "version=$($conf.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Stage portable exe
+        shell: pwsh
+        run: |
+          Copy-Item src-tauri\target\release\deepseek-harness.exe "src-tauri\target\release\bundle\DeepSeek-Harness_${{ steps.version.outputs.version }}_x64-portable.exe"
+
+      - name: Upload portable exe to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/DeepSeek-Harness_${{ steps.version.outputs.version }}_x64-portable.exe
+          tag_name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
