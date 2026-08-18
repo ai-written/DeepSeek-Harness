@@ -44,8 +44,8 @@ npm run build        # tauri build → release 产物
 - 免安装版：`src-tauri/target/release/deepseek-harness.exe`（单文件，双击即用）；CI 发布时以 `DeepSeek-Harness_<version>_x64-portable.exe` 附加到 GitHub Release 资产
 
   > **免安装版首次运行**：从浏览器下载的 exe 带"来自互联网"标记（MOTW），无代码签名时 Windows SmartScreen 可能**静默拦截双击**（无进程、无窗口、无提示；命令行运行则正常）。解决：右键 exe → 属性 → 勾选 **解除锁定** → 确定，再双击；或 PowerShell 执行 `Unblock-File .\DeepSeek-Harness_*_x64-portable.exe`。每次下载新版本都需重复一次（信誉按文件哈希计算）。彻底解决需代码签名（见下文）。
-- NSIS 安装包：`src-tauri/target/release/bundle/nsis/DeepSeek-Harness_0.1.0_x64-setup.exe`
-- MSI 安装包：`src-tauri/target/release/bundle/msi/DeepSeek-Harness_0.1.0_x64_en-US.msi`
+- NSIS 安装包：`src-tauri/target/release/bundle/nsis/DeepSeek-Harness_0.1.1_x64-setup.exe`
+- MSI 安装包：`src-tauri/target/release/bundle/msi/DeepSeek-Harness_0.1.1_x64_en-US.msi`
 
 要点：
 

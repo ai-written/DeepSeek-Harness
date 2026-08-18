@@ -179,23 +179,35 @@ fn spawn_harness() -> std::io::Result<Child> {
     let args = ["--profile", "web", "--port", "0"];
     #[cfg(target_os = "windows")]
     {
-        let node = match locate_node() {
-            Ok(n) => {
-                log_line(&format!("node.exe -> {}", n.display()));
-                n
-            }
-            Err(e) => {
-                log_line(&format!("locate_node failed: {e}"));
-                return Err(e);
-            }
-        };
-        let bin_js = match locate_dsh_bin_js(&node) {
+        // Locate dsh first (DSH_BIN override → dsh.cmd on PATH), then pick a
+        // node.exe — preferring one next to the npm global install, falling
+        // back to any node.exe on PATH. This also works on machines where
+        // node.exe and the npm global prefix live in different directories
+        // (nvm / custom npm prefixes), not just the sibling-layout install.
+        let bin_js = match locate_dsh_bin_js() {
             Ok(b) => {
                 log_line(&format!("dsh bin.js -> {}", b.display()));
                 b
             }
             Err(e) => {
                 log_line(&format!("locate_dsh_bin_js failed: {e}"));
+                return Err(e);
+            }
+        };
+        // <npm-dir>/node_modules/@deepseek-ai/dsh/lib/bin.js → <npm-dir>
+        let npm_dir = bin_js
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent());
+        let node = match locate_node(npm_dir.as_deref()) {
+            Ok(n) => {
+                log_line(&format!("node.exe -> {}", n.display()));
+                n
+            }
+            Err(e) => {
+                log_line(&format!("locate_node failed: {e}"));
                 return Err(e);
             }
         };
@@ -232,29 +244,26 @@ fn spawn_harness() -> std::io::Result<Child> {
     }
 }
 
-/// Find `node.exe` by scanning PATH for the directory that also holds the
-/// `dsh.cmd` shim (they are siblings in the npm global install dir). This
-/// avoids spawning `where`/`cmd` (which would flash a console window).
+/// Find `node.exe` to run dsh with. Prefers a node.exe next to the npm global
+/// install directory (i.e. where the dsh.cmd shim lives), then any node.exe on
+/// PATH. Never spawns `where`/`cmd` (which would flash a console window).
 #[cfg(target_os = "windows")]
-fn locate_node() -> std::io::Result<std::path::PathBuf> {
+fn locate_node(preferred_dir: Option<&std::path::Path>) -> std::io::Result<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH").ok_or_else(|| std::io::Error::other("PATH not set"))?;
     let dirs: Vec<_> = std::env::split_paths(&path_var).collect();
-    log_line(&format!(
-        "locate_node: scanning {} PATH dirs for node.exe + dsh.cmd sibling",
-        dirs.len()
-    ));
-    for dir in &dirs {
+    log_line(&format!("locate_node: scanning {} PATH dirs", dirs.len()));
+    if let Some(dir) = preferred_dir {
         let node = dir.join("node.exe");
-        let shim = dir.join("dsh.cmd");
-        if node.exists() && shim.exists() {
+        if node.exists() {
+            log_line(&format!("node.exe -> {} (next to npm global install)", node.display()));
             return Ok(node);
         }
+        log_line("node.exe not next to npm global install; scanning PATH");
     }
-    // Fall back to any node.exe on PATH (dsh might be shimmed elsewhere).
-    log_line("locate_node: no dsh.cmd sibling found; falling back to any node.exe on PATH");
     for dir in &dirs {
         let node = dir.join("node.exe");
         if node.exists() {
+            log_line(&format!("node.exe -> {} (from PATH)", node.display()));
             return Ok(node);
         }
     }
@@ -263,14 +272,42 @@ fn locate_node() -> std::io::Result<std::path::PathBuf> {
     ))
 }
 
-/// Resolve `node_modules/@deepseek-ai/dsh/lib/bin.js` relative to the node
-/// install directory already found by [`locate_node`] (passed in so the PATH
-/// scan + its log line happens exactly once).
+/// Locate the `dsh.cmd` shim on PATH. npm always places the shim in the same
+/// directory as its node_modules, so `lib/bin.js` resolves relative to the
+/// shim's directory — this works even when node.exe and the npm global prefix
+/// are in different directories (nvm / custom npm prefixes).
 #[cfg(target_os = "windows")]
-fn locate_dsh_bin_js(node: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    let dir = node
+fn locate_dsh_cmd() -> std::io::Result<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH").ok_or_else(|| std::io::Error::other("PATH not set"))?;
+    for dir in std::env::split_paths(&path_var) {
+        let shim = dir.join("dsh.cmd");
+        if shim.exists() {
+            log_line(&format!("dsh.cmd -> {}", shim.display()));
+            return Ok(shim);
+        }
+    }
+    Err(std::io::Error::other(
+        "dsh.cmd not found on PATH — run `npm install -g @deepseek-ai/dsh`",
+    ))
+}
+
+/// Resolve dsh's `lib/bin.js`. Priority:
+///   1. `$DSH_BIN` — explicit override (absolute path to bin.js)
+///   2. the `dsh.cmd` shim on PATH → sibling `node_modules/@deepseek-ai/dsh/lib/bin.js`
+#[cfg(target_os = "windows")]
+fn locate_dsh_bin_js() -> std::io::Result<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("DSH_BIN") {
+        let p = std::path::PathBuf::from(&explicit);
+        if p.exists() {
+            log_line(&format!("dsh bin.js -> {} (from DSH_BIN)", p.display()));
+            return Ok(p);
+        }
+        log_line(&format!("DSH_BIN set but not found: {explicit}; falling back to dsh.cmd on PATH"));
+    }
+    let shim = locate_dsh_cmd()?;
+    let dir = shim
         .parent()
-        .ok_or_else(|| std::io::Error::other("node.exe has no parent dir"))?;
+        .ok_or_else(|| std::io::Error::other("dsh.cmd has no parent dir"))?;
     let bin_js = dir
         .join("node_modules")
         .join("@deepseek-ai")
