@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
-use tauri::{Emitter, Manager, WindowEvent};
+use tauri::{Emitter, Listener, Manager, WindowEvent};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -114,6 +114,13 @@ fn log_line(msg: &str) {
 }
 
 struct HarnessState {
+    child: Mutex<Option<Child>>,
+    pid: Mutex<Option<u32>>,
+}
+
+/// The usage sidecar child (the badge's data source). Kept so it is killed on
+/// close alongside the harness.
+struct UsageState {
     child: Mutex<Option<Child>>,
     pid: Mutex<Option<u32>>,
 }
@@ -422,6 +429,212 @@ fn kill_tree(pid: Option<u32>) {
     }
 }
 
+// ── Daily-usage badge sidecar ───────────────────────────────────────────────
+// A second node child folds the DSH session logs (~/.dsh/sessions) and prints
+// one JSON line to stdout on start and every few seconds. main.rs forwards each
+// line to the in-window usage panel as a `dsh-usage` event. It is optional:
+// if the script or node cannot be resolved, the badge is simply unavailable and
+// the harness still runs.
+
+/// Resolve the usage sidecar script path: env override → dev cwd → exe dir →
+/// packaged resource dir. Strips the Windows `\\?\` extended-length prefix
+/// (Tauri's resource_dir may return one, which Node's module loader mishandles
+/// as EISDIR).
+fn usage_sidecar_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    let probe = |label: &str, p: std::path::PathBuf| -> Option<std::path::PathBuf> {
+        let p = strip_extended_prefix(p);
+        if p.exists() {
+            log_line(&format!("usage sidecar ({label}) -> {}", p.display()));
+            Some(p)
+        } else {
+            None
+        }
+    };
+    if let Ok(p) = std::env::var("DSH_USAGE_SIDECAR") {
+        if let Some(p) = probe("DSH_USAGE_SIDECAR", std::path::PathBuf::from(p)) {
+            return p;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(p) = probe("dev cwd", cwd.join("src-tauri").join("usage").join("usage-sidecar.mjs")) {
+            return p;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(p) = probe("exe dir", dir.join("usage").join("usage-sidecar.mjs")) {
+                return p;
+            }
+        }
+    }
+    if let Ok(dir) = app.path().resource_dir() {
+        if let Some(p) = probe("resource dir", dir.join("usage").join("usage-sidecar.mjs")) {
+            return p;
+        }
+    }
+    log_line("WARNING: could not resolve usage sidecar script; usage badge disabled");
+    std::path::PathBuf::from("usage-sidecar.mjs")
+}
+
+/// Strip the Windows extended-length `\\?\` prefix, which Node's CJS module
+/// loader cannot resolve (it fails with EISDIR on the drive root).
+#[cfg(target_os = "windows")]
+fn strip_extended_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    if let Some(s) = p.to_str() {
+        if let Some(rest) = s.strip_prefix("\\\\?\\") {
+            return std::path::PathBuf::from(rest);
+        }
+        if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+            return std::path::PathBuf::from(format!("\\\\{}", rest));
+        }
+    }
+    p
+}
+
+#[cfg(not(target_os = "windows"))]
+fn strip_extended_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    p
+}
+
+/// Spawn `node <usage-sidecar.mjs>`. Reads its stdout: each `{...}` line is
+/// emitted as `dsh-usage`; stderr and non-JSON stdout are forwarded to the
+/// startup log. Returns the child (kept so we can kill it on close).
+#[cfg(target_os = "windows")]
+fn spawn_usage_sidecar(app: &tauri::AppHandle) -> std::io::Result<Child> {
+    let script = usage_sidecar_path(app);
+    let node = locate_node(None)?;
+    let mut cmd = Command::new(node);
+    cmd.arg(&script)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    log_line(&format!("usage sidecar spawned pid={}", child.id()));
+    if let Some(out) = child.stdout.take() {
+        let h = app.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.starts_with('{') {
+                    let _ = h.emit("dsh-usage", t);
+                } else {
+                    log_line(&format!("[usage sidecar stdout] {t}"));
+                }
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                log_line(&format!("[usage sidecar stderr] {line}"));
+            }
+        });
+    }
+    Ok(child)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_usage_sidecar(app: &tauri::AppHandle) -> std::io::Result<Child> {
+    let script = usage_sidecar_path(app);
+    let mut cmd = Command::new("node");
+    cmd.arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    log_line(&format!("usage sidecar spawned pid={}", child.id()));
+    if let Some(out) = child.stdout.take() {
+        let h = app.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.starts_with('{') {
+                    let _ = h.emit("dsh-usage", t);
+                } else {
+                    log_line(&format!("[usage sidecar stdout] {t}"));
+                }
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                log_line(&format!("[usage sidecar stderr] {line}"));
+            }
+        });
+    }
+    Ok(child)
+}
+
+/// Resolve the pricing config file path (shared with the sidecar).
+fn usage_pricing_path() -> std::path::PathBuf {
+    let home = std::env::var("DSH_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+        });
+    home.join(".dsh").join("storages").join("usage-pricing.json")
+}
+
+/// Read the current pricing config as text, for the edit dialog in the panel.
+fn pricing_read() -> String {
+    match std::fs::read_to_string(usage_pricing_path()) {
+        Ok(s) => s,
+        Err(e) => format!("{{\"error\":{}}}", serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"?\"".into())),
+    }
+}
+
+/// Validate and write the pricing config back. Returns "ok" or an error string.
+/// The sidecar re-reads the file on every emit, so a change lands within seconds.
+///
+/// `e.payload()` delivers the JSON-encoding of whatever JS emitted, which for a
+/// JS emit of a *string* is the string itself wrapped in JSON quotes/escapes.
+/// Accept both that and a direct JSON object, unwrap to the object, and write
+/// it pretty — this avoids ever persisting a "JSON-string-wrapping-the-object".
+fn pricing_write(pricing: &str) -> String {
+    let as_obj = |v: serde_json::Value| -> Result<serde_json::Value, String> {
+        match v {
+            serde_json::Value::String(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
+            other => Ok(other),
+        }
+    };
+    let first: serde_json::Value = match serde_json::from_str(pricing) {
+        Err(e) => return e.to_string(),
+        Ok(v) => v,
+    };
+    let obj = match as_obj(first) {
+        Err(e) => return e.to_string(),
+        Ok(o) => o,
+    };
+    if !obj.is_object() {
+        return "expected a JSON object for pricing".to_string();
+    }
+    let pretty = match serde_json::to_string_pretty(&obj) {
+        Err(e) => return e.to_string(),
+        Ok(s) => s,
+    };
+    let path = usage_pricing_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return e.to_string();
+        }
+    }
+    match std::fs::write(&path, pretty) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    }
+}
+
 fn main() {
     init_log();
     log_line("main() entered");
@@ -432,6 +645,13 @@ fn main() {
     // decorations are off via tauri.conf.json decorations:false). The script
     // is idempotent (guards on window.__deepseekHarnessControls).
     let controls_js = include_str!("../window-controls.js");
+    // Daily-usage badge panel, injected on every page load (same mechanism as
+    // the titlebar). Listens for `dsh-usage` events emitted from the sidecar.
+    // Chart.js (bundled locally, see src-tauri/chart.umd.min.js) is prepended to
+    // the panel script: initialization scripts run outside the page CSP, so the
+    // library is always available to window.Chart inside the panel code.
+    let chart_js = include_str!("../chart.umd.min.js");
+    let usage_panel_js = format!("{chart_js}\n{}", include_str!("../usage-panel.js"));
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -440,6 +660,41 @@ fn main() {
                 pid: Mutex::new(None),
             });
             app.manage(state.clone());
+
+            // Daily-usage sidecar: spawn + read stdout on a background thread,
+            // forwarding each JSON line as a `dsh-usage` event to the usage panel.
+            let usage_state = Arc::new(UsageState {
+                child: Mutex::new(None),
+                pid: Mutex::new(None),
+            });
+            app.manage(usage_state.clone());
+            let usage_app = app.handle().clone();
+            let usage_state_thread = usage_state.clone();
+            std::thread::spawn(move || {
+                log_line("usage sidecar: starting…");
+                match spawn_usage_sidecar(&usage_app) {
+                    Ok(child) => {
+                        let pid = child.id();
+                        *usage_state_thread.pid.lock().unwrap() = Some(pid);
+                        *usage_state_thread.child.lock().unwrap() = Some(child);
+                        log_line(&format!("usage sidecar: pid stored={pid}"));
+                    }
+                    Err(e) => log_line(&format!("usage sidecar start failed: {e}")),
+                }
+            });
+            // Pricing read/save over events, not command-invoke: event IPC is
+            // ACL-allowed on the remote harness page, whereas custom command
+            // invoke is not allowed by default there.
+            let pricing_app = app.handle().clone();
+            app.handle().listen("usage-pricing-read", move |_e| {
+                let _ = pricing_app.emit("usage-pricing-data", pricing_read());
+            });
+            let pricing_app2 = app.handle().clone();
+            app.handle().listen("usage-pricing-save", move |e| {
+                let payload = e.payload();
+                let ack = pricing_write(payload);
+                let _ = pricing_app2.emit("usage-pricing-saved", ack);
+            });
 
             // Create the main window in code so the custom titlebar controls
             // can be injected as an initialization script (runs on the
@@ -458,6 +713,7 @@ fn main() {
                     .resizable(true)
                     .decorations(false)
                     .initialization_script(controls_js)
+                    .initialization_script(usage_panel_js)
                     // Log every page load (placeholder page AND the harness URL) so
                     // the log confirms the WebView actually reached the dsh UI —
                     // if navigation fails, the harness URL never appears here.
@@ -561,6 +817,10 @@ fn main() {
                 let pid = *state.pid.lock().unwrap();
                 log_line(&format!("killing harness pid={pid:?}"));
                 kill_tree(pid);
+                let usage_state = window.state::<Arc<UsageState>>();
+                let usage_pid = *usage_state.pid.lock().unwrap();
+                log_line(&format!("killing usage sidecar pid={usage_pid:?}"));
+                kill_tree(usage_pid);
                 window.app_handle().exit(0);
                 log_line("exit requested");
             }
@@ -573,6 +833,9 @@ fn main() {
                 let state = app_handle.state::<Arc<HarnessState>>();
                 let pid = *state.pid.lock().unwrap();
                 kill_tree(pid);
+                let usage_state = app_handle.state::<Arc<UsageState>>();
+                let usage_pid = *usage_state.pid.lock().unwrap();
+                kill_tree(usage_pid);
             }
             if let tauri::RunEvent::Exit = event {
                 log_line("RunEvent::Exit — app finished");
