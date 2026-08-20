@@ -436,10 +436,17 @@ fn kill_tree(pid: Option<u32>) {
 // if the script or node cannot be resolved, the badge is simply unavailable and
 // the harness still runs.
 
+// Embedded copy of the sidecar script, used only as a last resort so the
+// standalone portable exe (which ships with no resource files next to it) can
+// still run the badge. The file IS the source of truth — keep this in sync
+// with usage/usage-sidecar.mjs (it is included verbatim at compile time).
+const USAGE_SIDECAR_SRC: &str = include_str!("../usage/usage-sidecar.mjs");
+
 /// Resolve the usage sidecar script path: env override → dev cwd → exe dir →
-/// packaged resource dir. Strips the Windows `\\?\` extended-length prefix
-/// (Tauri's resource_dir may return one, which Node's module loader mishandles
-/// as EISDIR).
+/// packaged resource dir → embedded copy extracted to a writable per-user
+/// location. Strips the Windows `\\?\` extended-length prefix (Tauri's
+/// resource_dir may return one, which Node's module loader mishandles as
+/// EISDIR).
 fn usage_sidecar_path(app: &tauri::AppHandle) -> std::path::PathBuf {
     let probe = |label: &str, p: std::path::PathBuf| -> Option<std::path::PathBuf> {
         let p = strip_extended_prefix(p);
@@ -472,8 +479,50 @@ fn usage_sidecar_path(app: &tauri::AppHandle) -> std::path::PathBuf {
             return p;
         }
     }
-    log_line("WARNING: could not resolve usage sidecar script; usage badge disabled");
-    std::path::PathBuf::from("usage-sidecar.mjs")
+    // No external copy: fall back to the embedded script so the standalone
+    // portable exe keeps the badge. Extraction failure is swallowed — the
+    // badge is optional, the harness always runs.
+    match extract_embedded_sidecar() {
+        Some(p) => p,
+        None => {
+            log_line("WARNING: could not resolve usage sidecar script and could not extract the embedded copy; usage badge disabled");
+            std::path::PathBuf::from("usage-sidecar.mjs")
+        }
+    }
+}
+
+/// Write the embedded sidecar script to `%LOCALAPPDATA%\deepseek-harness\`
+/// (fallback: `TEMP\deepseek-harness\`) and return the absolute path. Always
+/// overwrites, so a newer exe refreshes an older extracted copy. Returns None
+/// only when every candidate location is unwritable.
+fn extract_embedded_sidecar() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            std::path::PathBuf::from(base)
+                .join("deepseek-harness")
+                .join("usage-sidecar.mjs"),
+        );
+    }
+    candidates.push(
+        std::env::temp_dir()
+            .join("deepseek-harness")
+            .join("usage-sidecar.mjs"),
+    );
+    for c in &candidates {
+        if let Some(parent) = c.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(c, USAGE_SIDECAR_SRC).is_ok() {
+            log_line(&format!("usage sidecar (embedded extract) -> {}", c.display()));
+            return Some(c.clone());
+        }
+        log_line(&format!(
+            "usage sidecar: could not write embedded copy to {}",
+            c.display()
+        ));
+    }
+    None
 }
 
 /// Strip the Windows extended-length `\\?\` prefix, which Node's CJS module
