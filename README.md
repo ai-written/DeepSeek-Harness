@@ -25,7 +25,7 @@ npm run build    # 打包 release
 
 - **即开即见**：窗口先显示带进度提示的占位页，dsh 就绪后自动切换到实际界面，冷启动不"黑屏"
 - **共享配置**：不注入 DSH_HOME，桌面版与 CLI 共用同一套配置/会话/凭据（`~/.dsh`）
-- **无边框窗口**：自定义标题栏（最小化 / 最大化 / 关闭），支持拖拽
+- **无边框窗口**：默认自定义标题栏（最小化 / 最大化 / 关闭），支持拖拽；可配置切换系统原生标题栏（见「配置」）
 - **无控制台闪窗**：直接 spawn `node.exe`，不弹 cmd 窗口
 - **启动日志**：所有关键步骤与 dsh 的 stderr 写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP），"双击没反应"可从这里排查
 - **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）
@@ -35,6 +35,26 @@ npm run build    # 打包 release
 ## 开发注意
 
 > ⚠️ 不要与正在运行的正式实例同时启动 dev：两个实例并发读写同一 session 文件（`~/.dsh/sessions/...`）会触发 zstd 日志损坏崩溃。测试前先退出正式实例，或用 `$env:DSH_HOME = "<临时目录>"` 隔离。
+
+## 配置
+
+可选配置放在 dsh 数据目录的 `storages` 下，不配置则全部用默认值。**首次启动会自动创建** `desktop-settings.json`（写入默认值，方便发现与修改）：
+
+- 设置了 `$DSH_HOME` 时：`$DSH_HOME/storages/desktop-settings.json`（`DSH_HOME` 即 `.dsh` 目录本身，与 CLI 约定一致）
+- 未设置 `$DSH_HOME` 时：`~/.dsh/storages/desktop-settings.json`
+
+```json
+{ "decorations": true, "usageBadge": true }
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `decorations` | `false` | `true` 时改用系统原生标题栏（隐藏自定义最小化/最大化/关闭按钮）；**重启应用生效** |
+| `usageBadge` | `true` | `false` 时**整个金额统计功能关闭**：不显示左下角 ¥ 胶囊、不启动统计 sidecar（无实时更新）、不注入统计弹窗 |
+
+> **生效检查**：启动日志 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP）会打印一行 `native window decorations (desktop-settings.json): true/false`，确认应用实际读取到的值。
+
+同目录的 `usage-pricing.json` 是计费价格/汇率配置（见「每日用量徽标」）。
 
 ## 打包发布
 

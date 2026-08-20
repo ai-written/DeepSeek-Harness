@@ -687,17 +687,86 @@ fn spawn_usage_sidecar(app: &tauri::AppHandle) -> std::io::Result<Child> {
     Ok(child)
 }
 
+/// A file under the dsh home's `storages` directory, shared with the CLI.
+/// `DSH_HOME` (when set) IS the `.dsh` directory itself — the same convention
+/// as the usage sidecar and dsh's own home resolution; otherwise fall back to
+/// `~/.dsh`.
+fn dsh_storages_file(name: &str) -> std::path::PathBuf {
+    let home = match std::env::var("DSH_HOME") {
+        Ok(h) => std::path::PathBuf::from(h),
+        Err(_) => std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".dsh"),
+    };
+    home.join("storages").join(name)
+}
+
 /// Resolve the pricing config file path (shared with the sidecar).
 fn usage_pricing_path() -> std::path::PathBuf {
-    let home = std::env::var("DSH_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var_os("USERPROFILE")
-                .or_else(|| std::env::var_os("HOME"))
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-        });
-    home.join(".dsh").join("storages").join("usage-pricing.json")
+    dsh_storages_file("usage-pricing.json")
+}
+
+/// Ensure `desktop-settings.json` exists, writing the default config when
+/// missing (same pattern as the sidecar's first-run usage-pricing.json).
+/// Failures are swallowed — a read-only home simply keeps the defaults.
+fn ensure_desktop_settings() {
+    let path = dsh_storages_file("desktop-settings.json");
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log_line(&format!("desktop-settings: create storages dir failed: {e}"));
+            return;
+        }
+    }
+    match std::fs::write(&path, "{\n  \"decorations\": false,\n  \"usageBadge\": true\n}\n") {
+        Ok(()) => log_line(&format!(
+            "desktop-settings.json created with defaults -> {}",
+            path.display()
+        )),
+        Err(e) => log_line(&format!(
+            "desktop-settings: could not create {} ({e}); using defaults",
+            path.display()
+        )),
+    }
+}
+
+/// Parsed `desktop-settings.json` (auto-created with defaults on first launch).
+struct DesktopSettings {
+    /// Use the native system titlebar instead of the custom injected one.
+    native_decorations: bool,
+    /// Show the daily-usage badge (¥ amount pill + stats dialog) and run the
+    /// usage sidecar that feeds it real-time data.
+    usage_badge: bool,
+}
+
+/// Read `desktop-settings.json` under the dsh storages dir, applying defaults
+/// for any missing/unknown field: `decorations` = false, `usageBadge` = true.
+fn read_desktop_settings() -> DesktopSettings {
+    ensure_desktop_settings();
+    let value = std::fs::read_to_string(dsh_storages_file("desktop-settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let get = |key: &str, default: bool| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default)
+    };
+    let settings = DesktopSettings {
+        native_decorations: get("decorations", false),
+        usage_badge: get("usageBadge", true),
+    };
+    log_line(&format!(
+        "native window decorations (desktop-settings.json): {}",
+        settings.native_decorations
+    ));
+    log_line(&format!("usage badge (desktop-settings.json): {}", settings.usage_badge));
+    settings
 }
 
 /// Read the current pricing config as text, for the edit dialog in the panel.
@@ -756,16 +825,32 @@ fn main() {
     log_line(&format!("close-test mode: {close_test}"));
 
     // Custom titlebar controls injected into every page load (the native
-    // decorations are off via tauri.conf.json decorations:false). The script
-    // is idempotent (guards on window.__deepseekHarnessControls).
+    // decorations are off by default). The script is idempotent (guards on
+    // window.__deepseekHarnessControls). When desktop-settings.json sets
+    // "decorations": true, use the native system titlebar instead and prepend
+    // a flag so the injected script skips its custom caption bar (it still
+    // forwards startup progress).
+    let desktop = read_desktop_settings();
+    let native_decorations = desktop.native_decorations;
+    let usage_badge_enabled = desktop.usage_badge;
     let controls_js = include_str!("../window-controls.js");
+    let controls_js = if native_decorations {
+        format!("window.__deepseekHarnessNativeDecorations = true;\n{controls_js}")
+    } else {
+        controls_js.to_string()
+    };
     // Daily-usage badge panel, injected on every page load (same mechanism as
     // the titlebar). Listens for `dsh-usage` events emitted from the sidecar.
     // Chart.js (bundled locally, see src-tauri/chart.umd.min.js) is prepended to
     // the panel script: initialization scripts run outside the page CSP, so the
     // library is always available to window.Chart inside the panel code.
-    let chart_js = include_str!("../chart.umd.min.js");
-    let usage_panel_js = format!("{chart_js}\n{}", include_str!("../usage-panel.js"));
+    // Skipped entirely when desktop-settings.json sets "usageBadge": false.
+    let usage_panel_js = if usage_badge_enabled {
+        let chart_js = include_str!("../chart.umd.min.js");
+        Some(format!("{chart_js}\n{}", include_str!("../usage-panel.js")))
+    } else {
+        None
+    };
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -776,39 +861,43 @@ fn main() {
             app.manage(state.clone());
 
             // Daily-usage sidecar: spawn + read stdout on a background thread,
-            // forwarding each JSON line as a `dsh-usage` event to the usage panel.
+            // forwarding each JSON line as a `dsh-usage` event to the usage
+            // panel. Disabled entirely when "usageBadge": false — no sidecar,
+            // no real-time updates, no panel.
             let usage_state = Arc::new(UsageState {
                 child: Mutex::new(None),
                 pid: Mutex::new(None),
             });
             app.manage(usage_state.clone());
-            let usage_app = app.handle().clone();
-            let usage_state_thread = usage_state.clone();
-            std::thread::spawn(move || {
-                log_line("usage sidecar: starting…");
-                match spawn_usage_sidecar(&usage_app) {
-                    Ok(child) => {
-                        let pid = child.id();
-                        *usage_state_thread.pid.lock().unwrap() = Some(pid);
-                        *usage_state_thread.child.lock().unwrap() = Some(child);
-                        log_line(&format!("usage sidecar: pid stored={pid}"));
+            if usage_badge_enabled {
+                let usage_app = app.handle().clone();
+                let usage_state_thread = usage_state.clone();
+                std::thread::spawn(move || {
+                    log_line("usage sidecar: starting…");
+                    match spawn_usage_sidecar(&usage_app) {
+                        Ok(child) => {
+                            let pid = child.id();
+                            *usage_state_thread.pid.lock().unwrap() = Some(pid);
+                            *usage_state_thread.child.lock().unwrap() = Some(child);
+                            log_line(&format!("usage sidecar: pid stored={pid}"));
+                        }
+                        Err(e) => log_line(&format!("usage sidecar start failed: {e}")),
                     }
-                    Err(e) => log_line(&format!("usage sidecar start failed: {e}")),
-                }
-            });
-            // Pricing read/save over events, not command-invoke: event IPC is
-            // ACL-allowed on the remote harness page, whereas custom command
-            // invoke is not allowed by default there.
-            let pricing_app = app.handle().clone();
-            app.handle().listen("usage-pricing-read", move |_e| {
-                let _ = pricing_app.emit("usage-pricing-data", pricing_read());
-            });
-            let pricing_app2 = app.handle().clone();
-            app.handle().listen("usage-pricing-save", move |e| {
-                let payload = e.payload();
-                let ack = pricing_write(payload);
-                let _ = pricing_app2.emit("usage-pricing-saved", ack);
-            });
+                });
+                // Pricing read/save over events, not command-invoke: event IPC is
+                // ACL-allowed on the remote harness page, whereas custom command
+                // invoke is not allowed by default there.
+                let pricing_app = app.handle().clone();
+                app.handle().listen("usage-pricing-read", move |_e| {
+                    let _ = pricing_app.emit("usage-pricing-data", pricing_read());
+                });
+                let pricing_app2 = app.handle().clone();
+                app.handle().listen("usage-pricing-save", move |e| {
+                    let payload = e.payload();
+                    let ack = pricing_write(payload);
+                    let _ = pricing_app2.emit("usage-pricing-saved", ack);
+                });
+            }
 
             // Create the main window in code so the custom titlebar controls
             // can be injected as an initialization script (runs on the
@@ -819,15 +908,19 @@ fn main() {
             // spawn can take a while (cold file cache + Defender rescans), so
             // the user sees the "正在启动…" placeholder with live status
             // updates instead of nothing at all.
-            let window_builder =
+            let mut window_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
                     .title("DeepSeek-Harness")
                     .inner_size(1280.0, 860.0)
                     .center()
                     .resizable(true)
-                    .decorations(false)
-                    .initialization_script(controls_js)
-                    .initialization_script(usage_panel_js)
+                    .decorations(native_decorations)
+                    .initialization_script(controls_js);
+            // Usage badge panel: only injected when enabled in desktop-settings.
+            if let Some(panel_js) = usage_panel_js {
+                window_builder = window_builder.initialization_script(panel_js);
+            }
+            let window_builder = window_builder
                     // Log every page load (placeholder page AND the harness URL) so
                     // the log confirms the WebView actually reached the dsh UI —
                     // if navigation fails, the harness URL never appears here.

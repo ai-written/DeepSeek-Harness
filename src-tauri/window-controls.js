@@ -1,8 +1,14 @@
 // window-controls.js — custom titlebar controls injected into the harness
-// page. The native decorations are off (decorations: false); this script
-// renders minimize / maximize / close buttons pinned to the top-right of the
-// page and a drag region, talking to the Tauri window through the global API
-// (withGlobalTauri: true + window permissions in capabilities).
+// page. By default the native decorations are off (decorations: false) and
+// this script renders minimize / maximize / close buttons pinned to the
+// top-right of the page plus a drag region, talking to the Tauri window
+// through the global API (withGlobalTauri: true + window permissions in
+// capabilities).
+//
+// When desktop-settings.json sets "decorations": true, main.rs uses the
+// native system titlebar instead and prepends
+// `window.__deepseekHarnessNativeDecorations = true;` to this script, which
+// skips the custom caption bar but keeps the startup-progress forwarding.
 //
 // Injected with WebviewWindowBuilder::initialization_script so it runs before
 // the page scripts on every navigation (placeholder and harness pages).
@@ -23,12 +29,37 @@
   }
   const appWindow = Tauri.window.getCurrentWindow()
 
+  // Native system titlebar (desktop-settings.json "decorations": true): skip
+  // the custom caption bar below; only the startup-progress forwarding stays.
+  const NATIVE = !!window.__deepseekHarnessNativeDecorations
+  let bar = null
+
+  // Decide whether the caption buttons need dark icons (light page) or light
+  // icons (dark page) by sampling the page's actual background luminance.
+  // The harness page theme is unknown at build time, so never assume it is
+  // dark — a light-themed page would otherwise hide the light icons.
+  function pageIsLight() {
+    if (document.getElementById('startup-panel')) return true
+    let el = document.body
+    while (el) {
+      const m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(getComputedStyle(el).backgroundColor)
+      if (m) {
+        const lum = 0.299 * +m[1] + 0.587 * +m[2] + 0.114 * +m[3]
+        return lum >= 128
+      }
+      el = el.parentElement
+    }
+    // Fully transparent background: fall back to dark (harness UI default).
+    return false
+  }
+
+  if (!NATIVE) {
   const BAR_HEIGHT = 38
   const BTN_W = 46
 
   // Container pinned to the top of the page. It must float above the harness
   // UI, so use a high z-index. Pointer events on the bar drag the window.
-  const bar = document.createElement('div')
+  bar = document.createElement('div')
   bar.id = 'deepseek-harness-titlebar'
   bar.style.cssText =
     'position:fixed;top:0;left:0;right:0;height:' + BAR_HEIGHT + 'px;' +
@@ -76,25 +107,6 @@
     return btn
   }
 
-  // Decide whether the caption buttons need dark icons (light page) or light
-  // icons (dark page) by sampling the page's actual background luminance.
-  // The harness page theme is unknown at build time, so never assume it is
-  // dark — a light-themed page would otherwise hide the light icons.
-  function pageIsLight() {
-    if (document.getElementById('startup-panel')) return true
-    let el = document.body
-    while (el) {
-      const m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(getComputedStyle(el).backgroundColor)
-      if (m) {
-        const lum = 0.299 * +m[1] + 0.587 * +m[2] + 0.114 * +m[3]
-        return lum >= 128
-      }
-      el = el.parentElement
-    }
-    // Fully transparent background: fall back to dark (harness UI default).
-    return false
-  }
-
   // Hover feedback: close turns red, others lighten. Colors follow the page's
   // actual background (checked live on every hover, not cached at mount).
   function attachHover(btn, close) {
@@ -140,6 +152,7 @@
   if (Tauri.event) {
     Tauri.event.listen('tauri://resize', refreshMaxIcon).catch(() => {})
   }
+  } // end: custom titlebar (skipped under native decorations)
 
   // Forward Rust-side startup progress to the placeholder page
   // (#dsh-startup-status and the step indicator in #startup-steps). No-op on
@@ -217,18 +230,20 @@
 
   // Append on DOMContentLoaded if the document is still loading, else now.
   function mount() {
-    if (!document.getElementById('deepseek-harness-titlebar')) {
-      document.body.appendChild(bar)
-      // Push harness content down so it isn't hidden under the transparent
-      // bar's drag strip; the buttons themselves sit on top of content.
+    if (!NATIVE) {
+      if (!document.getElementById('deepseek-harness-titlebar')) {
+        document.body.appendChild(bar)
+        // Push harness content down so it isn't hidden under the transparent
+        // bar's drag strip; the buttons themselves sit on top of content.
+      }
+      // Initial caption-button color: match the page's actual background
+      // luminance (light page → dark icons, dark page → light icons).
+      const light = pageIsLight()
+      const fg = light ? '#57606a' : '#c9d1d9'
+      bar.querySelectorAll('.dsh-caption-btn').forEach((b) => {
+        b.style.color = fg
+      })
     }
-    // Initial caption-button color: match the page's actual background
-    // luminance (light page → dark icons, dark page → light icons).
-    const light = pageIsLight()
-    const fg = light ? '#57606a' : '#c9d1d9'
-    bar.querySelectorAll('.dsh-caption-btn').forEach((b) => {
-      b.style.color = fg
-    })
     if (lastStartup) applyStartup(lastStartup)
   }
   if (document.readyState === 'loading') {
