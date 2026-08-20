@@ -1,84 +1,76 @@
 # DeepSeek-Harness
 
-Tauri v2 桌面壳，把 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的 Web UI（`dsh web`）嵌入系统 WebView 窗口。
+Tauri v2 桌面壳，将 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Web UI（`dsh web`）嵌入系统 WebView，并支持计费功能。
 
-架构一句话：**壳 spawn `dsh --profile web --port 0` → 解析它打印的 URL → WebView 加载 → 窗口关闭时杀进程树**。harness 本身不改一行代码。
+**工作原理**：壳启动 `dsh --profile web --port 0` → 解析它打印的 URL → WebView 加载 → 窗口关闭时清理整个进程树。harness 本身零改动。
+
+![alt text](./assets/image-1.png)
 
 ## 快速开始
 
 前置要求：
 
-- **Rust 工具链**（rustc/cargo ≥ 1.77）
-- **Node ≥ 22**（dsh 依赖 `node:sqlite`）
-- **全局 `@deepseek-ai/dsh`**：`npm i -g @deepseek-ai/dsh`
-- **WebView2 Runtime**（Win11 自带；Win10 需安装）
+- Rust 工具链（≥ 1.77）
+- Node ≥ 22
+- 全局安装 dsh：`npm i -g @deepseek-ai/dsh`
+- WebView2 Runtime（Win11 自带，Win10 需安装）
 
 ```bash
-npm install          # 装 @tauri-apps/cli + sharp
-npm run dev          # tauri dev，启动壳 + 外部 dsh
+npm install
+npm run dev      # 开发运行
+npm run build    # 打包 release
 ```
 
-## 运行时行为
+## 特性
 
-- **启动即见占位窗口**：窗口创建后立即显示（不再等 dsh 就绪才 show），占位页带 spinner + 实时进度（定位 dsh → 启动 → 等待服务 → 加载界面），开机冷启动慢时用户有明确反馈而非"黑屏干等"；
-- **DSH_HOME 不注入**：dsh 用自己的官方解析链（`$DSH_HOME` → `~/.dsh`），桌面版与 CLI **共享同一套配置、会话、凭据和插件**；
-- **原生目录选择器**：走 dsh 默认 Win32 文件夹对话框；
-- **自定义标题栏**：系统标题栏隐藏（`decorations: false`），右上角注入 最小化/最大化/关闭 按钮，标题栏区域可拖拽（双击最大化）；
-- **无控制台窗口**：直接 spawn `node.exe` + `bin.js`（`CREATE_NO_WINDOW`），不弹 cmd/PowerShell 窗口；
-- **启动日志**：GUI 无控制台，eprintln 用户不可见——所有关键步骤（环境变量/PATH 扫描 → 定位 node → 找到 dsh bin.js → spawn → 等待 URL → 页面加载 → 关闭清理）同时写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（每次启动截断重写，带 t+相对时间戳）。dsh 子进程的 stderr 也会逐行转发进日志；启动超时时会把超时前最后 25 行输出一并 dump——"双击没反应"可直接看日志定位。`%LOCALAPPDATA%` 不可写（策略/沙箱）时自动回退 TEMP、再退到 exe 同目录，日志首行会打印实际路径；
-- **关闭清理**：窗口关闭（X / Alt+F4）→ `CloseRequested` → `kill_tree`（Windows `taskkill /T /F` 杀整个进程树）→ 退出；已通过 `--close-test` 自动化验证，无进程残留；
-- **dev/release WebView 隔离**：debug 构建使用独立 WebView2 数据目录（`%LOCALAPPDATA%\com.deepseekharness.desktop\deepseek-harness-dev`，不可写时回退 TEMP），dev 实例不会与正在运行的 release 实例共享 cookie/本地存储/WebView 状态（同 identifier 默认同目录会导致 dev 窗口加载 release 窗口的页面）。
+- **即开即见**：窗口先显示带进度提示的占位页，dsh 就绪后自动切换到实际界面，冷启动不"黑屏"
+- **共享配置**：不注入 DSH_HOME，桌面版与 CLI 共用同一套配置/会话/凭据（`~/.dsh`）
+- **无边框窗口**：自定义标题栏（最小化 / 最大化 / 关闭），支持拖拽
+- **无控制台闪窗**：直接 spawn `node.exe`，不弹 cmd 窗口
+- **启动日志**：所有关键步骤与 dsh 的 stderr 写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP），"双击没反应"可从这里排查
+- **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）
+- **兼容新旧 dsh**：自动探测 `--no-open` 支持——新版 dsh 不弹系统浏览器；旧版自动回退（仅可能弹出浏览器，不影响使用）
+- **干净退出**：关闭窗口即杀掉 dsh 整棵进程树，无残留
 
-## 开发注意（重要）
+## 开发注意
 
-**不要与正在运行的正式实例同时启动 dev**：dsh 的会话持久化按工作目录索引（`~/.dsh/sessions/<项目路径>/...`），两个实例并发读写同一 session 文件会触发 `corrupt Zstandard session log` 崩溃。dev 测试前请先退出正式实例，或用独立 home 隔离：`$env:DSH_HOME = "<临时目录>"; npm run dev`（dsh 尊重 `$DSH_HOME`）。
+> ⚠️ 不要与正在运行的正式实例同时启动 dev：两个实例并发读写同一 session 文件（`~/.dsh/sessions/...`）会触发 zstd 日志损坏崩溃。测试前先退出正式实例，或用 `$env:DSH_HOME = "<临时目录>"` 隔离。
 
 ## 打包发布
 
 ```bash
-npm run build        # tauri build → release 产物
+npm run build
 ```
 
-产物：
+产物（`src-tauri/target/release/` 下）：
 
-- 免安装版：`src-tauri/target/release/deepseek-harness.exe`（单文件，双击即用）；CI 发布时以 `DeepSeek-Harness_<version>_x64-portable.exe` 附加到 GitHub Release 资产
-
-  > **免安装版首次运行**：从浏览器下载的 exe 带"来自互联网"标记（MOTW），无代码签名时 Windows SmartScreen 可能**静默拦截双击**（无进程、无窗口、无提示；命令行运行则正常）。解决：右键 exe → 属性 → 勾选 **解除锁定** → 确定，再双击；或 PowerShell 执行 `Unblock-File .\DeepSeek-Harness_*_x64-portable.exe`。每次下载新版本都需重复一次（信誉按文件哈希计算）。彻底解决需代码签名（见下文）。
-- NSIS 安装包：`src-tauri/target/release/bundle/nsis/DeepSeek-Harness_0.1.3_x64-setup.exe`
-- MSI 安装包：`src-tauri/target/release/bundle/msi/DeepSeek-Harness_0.1.3_x64_en-US.msi`
-
-要点：
-
-- **不打包 dsh**：安装包只有壳，目标机器需 Node ≥ 22 + 全局 dsh；
-- 图标：`node scripts/make-ico.mjs` 从 `assets/favicon.svg`（官方 DSH logo）渲染黑色多尺寸 `icon.ico`；
-- Windows 分发建议代码签名（SmartScreen）。
-
-## 核心实现（src-tauri/src/main.rs）
-
-| 职责 | 实现 |
+| 产物 | 说明 |
 |---|---|
-| spawn dsh | Windows 定位 `dsh.cmd` shim → 直接 spawn `node.exe <install>/lib/bin.js`（CREATE_NO_WINDOW） |
-| 解析 URL | 后台线程读 stdout，匹配 `dsh web: http://127.0.0.1:<port>`，120s 超时 |
-| 加载页面 | `window.navigate(url)`，同源直连过 `/api` 信任栅栏 |
-| 自定义标题栏 | `window-controls.js` 通过 `initialization_script` 注入（占位页与 harness 页都生效） |
-| 关闭清理 | `on_window_event(CloseRequested)` → kill_tree → exit |
-| 启动失败 | 占位页红字显示原因，窗口保持打开可读（标题栏 X 关闭仍走清理路径） |
+| `deepseek-harness.exe` | 免安装版，单文件双击即用；CI 发布为 `DeepSeek-Harness_<version>_x64-portable.exe` |
+| `bundle/nsis/DeepSeek-Harness_<version>_x64-setup.exe` | NSIS 安装包 |
+| `bundle/msi/DeepSeek-Harness_<version>_x64_en-US.msi` | MSI 安装包 |
 
-## 验证记录
+> **免安装版首次运行**：浏览器下载的 exe 带"来自互联网"标记，SmartScreen 可能静默拦截双击。右键 exe → 属性 → 勾选**解除锁定**（或 `Unblock-File`）。彻底解决需代码签名。
+>
+> 目标机器需 Node ≥ 22 + 全局 `@deepseek-ai/dsh`；安装包本身**不含 dsh**。
 
-- `cargo check` 零警告；
-- 启动 → dsh spawn → 监听新端口（不与既有 3080 宿主冲突）；
-- 无边框窗口 + 自定义按钮运行正常；
-- `--close-test` 自动关闭 → 应用退出 + dsh 进程树清理，全链路日志确认；
-- 启动日志实测：日志含环境变量、PATH 扫描、spawn pid、dsh stderr 转发（崩溃堆栈逐行可见）、失败原因、taskkill 结果，全部带 t+ 时间戳；`%LOCALAPPDATA%` 不可写时回退 TEMP 验证通过。
+## 每日用量徽标
 
-## 每日用量徽标（本机桌面，实时）
+主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日用量图表（含金额、token、缓存命中率合计），并编辑汇率与单价。
 
-主窗口左下角（左侧栏"设置按钮"右侧）有一个小的「¥X.XX」胶囊，显示当天使用 dsh 的**估算费用（人民币）**，随用量增加实时刷新；悬停可看日期/请求/近 7 日，**点击胶囊弹出编辑框**可改汇率与单价。
+- **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 zstd），每 3 秒增量刷新；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染
+- **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率与峰谷时段计价；sidecar 每次刷新重读，改动即时生效
+- **只读与降级**：sidecar 只读日志、不写会话文件；脚本缺失或 node 不可用时仅日志告警，不影响主功能
+- **打包**：脚本作为资源打进安装包（从 `resource_dir()` 定位），同时以 `include_str!` 嵌入 exe 本体——免安装版找不到外部脚本时会自动解压到 `%LOCALAPPDATA%\deepseek-harness\` 再运行
 
-- **数据**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），直接折叠 `~/.dsh/sessions` 的会话日志（多帧 zstd），每 3 秒轮询增量，把「今日 ¥/USD、请求数、近 7 日」以一行 JSON 打到 stdout；Rust 侧把每行 forward 成 `dsh-usage` 事件，注入的 `src-tauri/usage-panel.js`（与标题栏同机制）监听并更新面板。
-- **依赖**：不依赖 dsh 是否在跑、不依赖任何 harness 插件；只需本机能读到 dsh 的会话日志和价格配置。
-- **价格/汇率**：点面板弹窗保存（或直接改 `~/.dsh/storages/usage-pricing.json`：`exchangeRate`、`default`、`overrides`），sidecar 每次刷新重读即生效；文件不存在时用内置默认值。弹窗通过 Rust 的**事件**读写该文件（`usage-pricing-read`/`-save`，用事件而非命令插件，因为 remote 页面里自定义命令 invoke 默认不被 ACL 放行）。支持**峰谷计价**：可选 `timeOfUse` = `{ enabled, peakMultiplier, valleyMultiplier, peakRanges: [[起时h,止时h],…] }`（本地 24h），折叠时按小时分桶 token、算钱时按小时乘倍率（高峰贵、低谷便宜）。
-- **只读**：sidecar 只读日志、不写日志文件；唯一可写的是用户编辑价格的那个 JSON。
-- **故障降级**：sidecar 或脚本定位不到时仅日志告警，主窗口/dsh 照常运行。
-- **打包**：sidecar 已加入 `tauri.conf.json` 的 `bundle.resources`（映射到 `usage/usage-sidecar.mjs`），安装版从 `resource_dir()` 定位；同时脚本以 `include_str!` 嵌入主程序，**免安装版（裸 exe）定位不到外部脚本时会自动解压到 `%LOCALAPPDATA%\deepseek-harness\usage-sidecar.mjs`（回退 TEMP）再运行**，因此单文件便携版也能显示徽标。
+## 目录结构
+
+```
+src-tauri/
+├── src/main.rs             # 壳：spawn dsh、解析 URL、事件转发、进程清理
+├── usage-panel.js          # 用量徽标 UI（注入页面）
+├── usage/usage-sidecar.mjs # 用量统计 sidecar
+├── window-controls.js      # 自定义标题栏
+└── tauri.conf.json         # Tauri 配置（含资源打包）
+.github/workflows/release.yml  # 推送 v* tag 自动构建并发布 GitHub Release
+```

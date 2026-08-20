@@ -182,8 +182,19 @@ fn webview_data_dir() -> std::path::PathBuf {
     }
 }
 
+/// Whether the installed dsh web supports `--no-open`; feature-detected once
+/// per process by asking the web command's `--help` (see supports_no_open).
+static SUPPORTS_NO_OPEN: OnceLock<bool> = OnceLock::new();
+
 fn spawn_harness() -> std::io::Result<Child> {
-    let args = ["--profile", "web", "--port", "0"];
+    // Newer dsh web versions open the default browser by default; the shell
+    // serves the UI in its own WebView instead. Only pass --no-open when the
+    // installed dsh understands it — older versions reject the unknown option
+    // and abort the boot (see supports_no_open).
+    let mut args = vec!["--profile", "web", "--port", "0"];
+    if supports_no_open() {
+        args.insert(2, "--no-open");
+    }
     #[cfg(target_os = "windows")]
     {
         // Locate dsh first (DSH_BIN override → dsh.cmd on PATH), then pick a
@@ -202,12 +213,7 @@ fn spawn_harness() -> std::io::Result<Child> {
             }
         };
         // <npm-dir>/node_modules/@deepseek-ai/dsh/lib/bin.js → <npm-dir>
-        let npm_dir = bin_js
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent());
+        let npm_dir = npm_install_dir(&bin_js);
         let node = match locate_node(npm_dir.as_deref()) {
             Ok(n) => {
                 log_line(&format!("node.exe -> {}", n.display()));
@@ -219,7 +225,7 @@ fn spawn_harness() -> std::io::Result<Child> {
             }
         };
         let mut cmd = Command::new(node);
-        cmd.arg(&bin_js).args(args);
+        cmd.arg(&bin_js).args(&args);
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -238,7 +244,7 @@ fn spawn_harness() -> std::io::Result<Child> {
     #[cfg(not(target_os = "windows"))]
     {
         let mut cmd = Command::new("dsh");
-        cmd.args(args);
+        cmd.args(&args);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -249,6 +255,65 @@ fn spawn_harness() -> std::io::Result<Child> {
         }
         result
     }
+}
+
+/// The npm global install directory, derived from
+/// `<npm-dir>/node_modules/@deepseek-ai/dsh/lib/bin.js`.
+fn npm_install_dir(bin_js: &std::path::Path) -> Option<std::path::PathBuf> {
+    bin_js
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+}
+
+/// Run `dsh --profile web --help` and return its stdout (None when the probe
+/// itself fails: dsh/node missing or a spawn error). The web app parses flags
+/// before binding anything, so this starts no server and needs no profile.
+fn dsh_help_output() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let bin_js = locate_dsh_bin_js().ok()?;
+        let node = locate_node(npm_install_dir(&bin_js).as_deref()).ok()?;
+        let output = Command::new(node)
+            .arg(&bin_js)
+            .args(["--profile", "web", "--help"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8(output.stdout).ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("dsh")
+            .args(["--profile", "web", "--help"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8(output.stdout).ok()
+    }
+}
+
+/// Whether the installed dsh web supports `--no-open` (detected once per
+/// process). Older dsh versions reject the flag as an unknown option and abort
+/// the boot, so the shell only passes it when the help text lists it. When the
+/// probe cannot run, defaults to false: an older dsh keeps its old behavior,
+/// and a newer one may open the browser — cosmetic, not fatal.
+fn supports_no_open() -> bool {
+    *SUPPORTS_NO_OPEN.get_or_init(|| {
+        let supported = dsh_help_output()
+            .map(|help| help.contains("--no-open"))
+            .unwrap_or(false);
+        log_line(&format!("dsh web supports --no-open: {supported}"));
+        supported
+    })
 }
 
 /// Find `node.exe` to run dsh with. Prefers a node.exe next to the npm global

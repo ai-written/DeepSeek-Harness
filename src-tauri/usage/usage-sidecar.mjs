@@ -10,7 +10,8 @@
 // tails, so each poll is cheap. No checkpoint file written.
 //
 // Print protocol: one JSON object per line, e.g.
-//   {"today":{"date":"2026-08-19","cny":12.34,"usd":1.714,"requests":89,...},
+//   {"today":{"date":"2026-08-19","cny":12.34,"usd":1.714,"requests":89,
+//             "hourly":[{hour,usd,requests,input,cacheRead,cacheWrite,output}×24], ...},
 //    "recent":[{date,usd,requests},...],"exchangeRate":7.2}
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
@@ -147,27 +148,37 @@ function modelMultiplier(pricing, provider, model) {
   return pricing.multiplier ?? 1;
 }
 
-function costUsd(bucket, pricing) {
+/// Cost of one hour's tokens for a bucket: that hour's time-of-use multiplier
+/// and the model multiplier applied. Shared by costUsd (bucket total) and the
+/// per-hour series emitted to the panel's day view.
+function hourlyCostUsd(bucket, hour, pricing) {
   const p = resolvePrice(pricing, bucket.provider, bucket.model);
-  const tou = modelTimeOfUse(pricing, bucket.provider, bucket.model);
   const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
+  const m = bucket.hourly?.[hour];
+  if (!m) return 0;
+  const mult = multiplierFor(hour, modelTimeOfUse(pricing, bucket.provider, bucket.model));
+  return (
+    ((m.input / 1e6) * p.inputPerMillion +
+      (m.cacheRead / 1e6) * p.cacheReadPerMillion +
+      (m.cacheWrite / 1e6) * p.cacheWritePerMillion +
+      (m.output / 1e6) * p.outputPerMillion) *
+    mult *
+    mm
+  );
+}
+
+function costUsd(bucket, pricing) {
   // If the bucket carries hourly token splits, price per hour so peak/valley
   // time-of-use multipliers apply; otherwise fall back to flat pricing.
   const h = bucket.hourly;
   if (h && Array.isArray(h) && h.length === 24) {
     let total = 0;
-    for (let hour = 0; hour < 24; hour++) {
-      const m = h[hour];
-      const mult = multiplierFor(hour, tou);
-      total +=
-        ((m.input / 1e6) * p.inputPerMillion +
-          (m.cacheRead / 1e6) * p.cacheReadPerMillion +
-          (m.cacheWrite / 1e6) * p.cacheWritePerMillion +
-          (m.output / 1e6) * p.outputPerMillion) *
-        mult;
-    }
-    return total * mm;
+    for (let hour = 0; hour < 24; hour++) total += hourlyCostUsd(bucket, hour, pricing);
+    return total;
   }
+  const p = resolvePrice(pricing, bucket.provider, bucket.model);
+  const tou = modelTimeOfUse(pricing, bucket.provider, bucket.model);
+  const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
   const mult = multiplierFor(flatHour(), tou);
   return (
     ((bucket.input / 1e6) * p.inputPerMillion +
@@ -192,7 +203,7 @@ function flatHour() {
   return new Date().getHours(); // approximate for buckets without hourly splits
 }
 function initHourly() {
-  return Array.from({ length: 24 }, () => ({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }));
+  return Array.from({ length: 24 }, () => ({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0, requests: 0 }));
 }
 /** Peak/valley multiplier for a local hour. Flat (1) when time-of-use is off. */
 function multiplierFor(hour, tou) {
@@ -303,6 +314,7 @@ function foldSession(file) {
           hc.cacheRead += cr;
           hc.cacheWrite += cw;
           hc.output += out;
+          hc.requests = (hc.requests || 0) + 1;
         }
         dayObj.set(key, b);
       }
@@ -346,9 +358,26 @@ function emit(pricing) {
     }
     return { date: d, usd: +u.toFixed(4), requests: r, input: inp, output: out, cacheRead: cr, cacheWrite: cw };
   });
+  // Per-hour series for today (0–24), feeding the panel's 天 (day) view.
+  const hourly = Array.from({ length: 24 }, (_, h) => {
+    let u = 0, r = 0, inp = 0, out = 0, cr = 0, cw = 0;
+    if (dayObj) {
+      for (const b of dayObj.values()) {
+        const hb = b.hourly?.[h];
+        if (!hb) continue;
+        inp += hb.input;
+        cr += hb.cacheRead;
+        cw += hb.cacheWrite;
+        out += hb.output;
+        r += hb.requests || 0;
+        u += hourlyCostUsd(b, h, pricing);
+      }
+    }
+    return { hour: h, usd: +u.toFixed(4), requests: r, input: inp, cacheRead: cr, cacheWrite: cw, output: out };
+  });
   console.log(
     JSON.stringify({
-      today: { date: today, cny: +(usd * pricing.exchangeRate).toFixed(2), usd: +usd.toFixed(4), requests, input, output, cacheRead, cacheWrite },
+      today: { date: today, cny: +(usd * pricing.exchangeRate).toFixed(2), usd: +usd.toFixed(4), requests, input, output, cacheRead, cacheWrite, hourly },
       recent,
       exchangeRate: pricing.exchangeRate,
     }),

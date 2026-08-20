@@ -323,7 +323,7 @@
     return d
   }
 
-  let chartRange = 'week' // 'week' | 'month'
+  let chartRange = 'day' // 'day' | 'week' | 'month'
   let chartInstance = null
 
   function renderChartTab() {
@@ -332,7 +332,7 @@
     const recent = Array.isArray(payload.recent) ? payload.recent : []
     const rate = payload.exchangeRate || 7.2
 
-    // 周 / 月 range toggle.
+    // 天 / 周 / 月 range toggle.
     const bar = document.createElement('div')
     bar.style.cssText = 'display:flex;gap:6px;margin-bottom:2px;'
     const mk = (label, range) => {
@@ -347,21 +347,80 @@
       }
       return b
     }
+    bar.appendChild(mk('天', 'day'))
     bar.appendChild(mk('周', 'week'))
     bar.appendChild(mk('月', 'month'))
     modalContent.appendChild(bar)
 
-    if (!recent.length) {
+    // Series data: 天 = today's 0–24 hourly; 周/月 = recent days (chronological).
+    let points = []
+    let rangeLabel = ''
+    if (chartRange === 'day') {
+      const hourly = Array.isArray(payload.today?.hourly) ? payload.today.hourly : []
+      points = hourly.map((h, i) => ({
+        date: String(i).padStart(2, '0') + ':00',
+        // hover range: "09:00 - 10:00"; the last hour ends at 24:00
+        title: String(i).padStart(2, '0') + ':00 - ' + String(i + 1).padStart(2, '0') + ':00',
+        usd: h.usd,
+        input: h.input,
+        cacheRead: h.cacheRead,
+        cacheWrite: h.cacheWrite,
+        output: h.output,
+      }))
+      rangeLabel = '今日'
+    } else {
+      const limit = chartRange === 'month' ? 30 : 7
+      points = recent
+        .slice(0, limit)
+        .reverse()
+        .map((d) => ({
+          date: (d.date || '').slice(5),
+          usd: d.usd,
+          input: d.input,
+          cacheRead: d.cacheRead,
+          cacheWrite: d.cacheWrite,
+          output: d.output,
+        }))
+      rangeLabel = chartRange === 'month' ? '近 30 日' : '近 7 日'
+    }
+    if (!points.length) {
       modalContent.appendChild(emptyBox('暂无用量数据'))
       return
     }
-    const limit = chartRange === 'month' ? 30 : 7
-    const days = recent.slice(0, limit).reverse() // chronological for the chart
-    const rangeLabel = chartRange === 'month' ? '近 30 日' : '近 7 日'
-    const labels = days.map((d) => (d.date || '').slice(5))
-    const amount = days.map((d) => +((d.usd || 0) * rate).toFixed(2))
-    const tokens = days.map((d) => totalTokens(d))
-    const hit = days.map((d) => +hitRateOf(d).toFixed(1))
+    const labels = points.map((p) => p.date)
+    const amount = points.map((p) => +((p.usd || 0) * rate).toFixed(2))
+    const tokens = points.map((p) => totalTokens(p))
+    const hit = points.map((p) => +hitRateOf(p).toFixed(1))
+
+    // ── range totals: day / week / month summary above the chart ──
+    const totalUsd = points.reduce((s, p) => s + (Number(p.usd) || 0), 0)
+    const totalTok = points.reduce((s, p) => s + totalTokens(p), 0)
+    const totIn = points.reduce((s, p) => s + (Number(p.input) || 0), 0)
+    const totCr = points.reduce((s, p) => s + (Number(p.cacheRead) || 0), 0)
+    const totalHit = totIn + totCr > 0 ? (totCr / (totIn + totCr)) * 100 : 0
+
+    modalContent.appendChild(chartTitle(rangeLabel + '合计'))
+    const statsRow = document.createElement('div')
+    statsRow.style.cssText = 'display:flex;gap:10px;margin:0 0 4px;'
+    const mkStat = (label, value) => {
+      const box = document.createElement('div')
+      box.style.cssText =
+        'flex:1;padding:10px 12px;border-radius:10px;background:#f6f8fa;border:1px solid #eef0f3;'
+      const v = document.createElement('div')
+      v.textContent = value
+      v.style.cssText =
+        'font-size:17px;font-weight:700;color:#1f2328;font-variant-numeric:tabular-nums;white-space:nowrap;'
+      const l = document.createElement('div')
+      l.textContent = label
+      l.style.cssText = 'margin-top:2px;font-size:11px;color:#57606a;'
+      box.appendChild(v)
+      box.appendChild(l)
+      return box
+    }
+    statsRow.appendChild(mkStat('总金额（¥）', fmtMoney(totalUsd, rate)))
+    statsRow.appendChild(mkStat('总 token', fmtTokens(totalTok)))
+    statsRow.appendChild(mkStat('缓存命中率', totalHit.toFixed(1) + '%'))
+    modalContent.appendChild(statsRow)
 
     modalContent.appendChild(chartTitle(rangeLabel + ' 用量概览（金额 / token / 缓存命中率）'))
     const wrap = document.createElement('div')
@@ -433,7 +492,10 @@
           legend: { position: 'top', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 }, color: '#57606a' } },
           tooltip: {
             callbacks: {
-              title: (items) => (items.length ? days[items[0].dataIndex]?.date || '' : ''),
+              title: (items) =>
+                items.length
+                  ? points[items[0].dataIndex]?.title || points[items[0].dataIndex]?.date || ''
+                  : '',
               label: (c) => {
                 if (c.datasetIndex === 0) return '金额：¥' + c.parsed.y
                 if (c.datasetIndex === 1) return 'token：' + fmtTokens(c.parsed.y)
