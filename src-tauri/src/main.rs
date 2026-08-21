@@ -724,7 +724,7 @@ fn ensure_desktop_settings() {
     }
     match std::fs::write(
         &path,
-        "{\n  \"decorations\": false,\n  \"usageBadge\": true,\n  \"updateCheck\": true,\n  \"updateCheckIntervalHours\": 24\n}\n",
+        "{\n  \"decorations\": false,\n  \"usageBadge\": true,\n  \"updateCheck\": true\n}\n",
     ) {
         Ok(()) => log_line(&format!(
             "desktop-settings.json created with defaults -> {}",
@@ -737,8 +737,16 @@ fn ensure_desktop_settings() {
     }
 }
 
-/// Default GitHub releases endpoint for update checks.
+/// Default "latest release" page for update checks. This is GitHub's HTML
+/// endpoint — it 302-redirects to the newest release tag and does NOT consume
+/// the GitHub API quota (60 req/h/IP unauthenticated), so update checks can no
+/// longer be silently killed by rate limiting.
 const DEFAULT_UPDATE_ENDPOINT: &str =
+    "https://github.com/ai-written/DeepSeek-Harness/releases/latest";
+/// Best-effort release-notes source (GitHub API). Only consulted when a newer
+/// version is actually detected; a rate-limited/failed call degrades to empty
+/// notes and never blocks the banner.
+const DEFAULT_API_ENDPOINT: &str =
     "https://api.github.com/repos/ai-written/DeepSeek-Harness/releases/latest";
 const DEFAULT_UPDATE_URL: &str = "https://github.com/ai-written/DeepSeek-Harness";
 
@@ -751,12 +759,10 @@ struct DesktopSettings {
     usage_badge: bool,
     /// Whether to perform GitHub update checks. Default true.
     update_check: bool,
-    /// Override endpoint for update checks. Default is DEFAULT_UPDATE_ENDPOINT.
+    /// Override "latest release" page for update checks (expects the HTML
+    /// `/releases/latest` URL that redirects to the newest tag). Default is
+    /// DEFAULT_UPDATE_ENDPOINT.
     update_endpoint: String,
-    /// Interval between update checks in hours. 0 = every launch. Default 24.
-    update_interval_hours: u64,
-    /// Last update check unix seconds.
-    last_update_check: Option<u64>,
     /// Ignored update version tag (e.g. "v0.1.6").
     ignored_update: Option<String>,
 }
@@ -782,27 +788,16 @@ fn read_desktop_settings() -> DesktopSettings {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| DEFAULT_UPDATE_ENDPOINT.to_string());
-    let last_update_check = value
-        .as_ref()
-        .and_then(|v| v.get("lastUpdateCheck"))
-        .and_then(|v| v.as_u64());
     let ignored_update = value
         .as_ref()
         .and_then(|v| v.get("ignoredUpdate"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let update_interval_hours = value
-        .as_ref()
-        .and_then(|v| v.get("updateCheckIntervalHours"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(24);
     let settings = DesktopSettings {
         native_decorations: get_bool("decorations", false),
         usage_badge: get_bool("usageBadge", true),
         update_check: get_bool("updateCheck", true),
         update_endpoint,
-        update_interval_hours,
-        last_update_check,
         ignored_update,
     };
     log_line(&format!(
@@ -812,45 +807,10 @@ fn read_desktop_settings() -> DesktopSettings {
     log_line(&format!("usage badge (desktop-settings.json): {}", settings.usage_badge));
     log_line(&format!("update check (desktop-settings.json): {}", settings.update_check));
     log_line(&format!("update endpoint: {}", settings.update_endpoint));
-    log_line(&format!(
-        "update interval: {}h",
-        settings.update_interval_hours
-    ));
-    if let Some(ts) = settings.last_update_check {
-        log_line(&format!("lastUpdateCheck: {ts}"));
-    }
     if let Some(ref ig) = settings.ignored_update {
         log_line(&format!("ignoredUpdate: {ig}"));
     }
     settings
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn persist_last_update_check() -> Result<(), String> {
-    let path = dsh_storages_file("desktop-settings.json");
-    let mut value: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !value.is_object() {
-        value = serde_json::json!({});
-    }
-    let now = now_unix_secs();
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("lastUpdateCheck".to_string(), serde_json::Value::Number(now.into()));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let pretty = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 fn persist_ignored_update(version: &str) -> Result<(), String> {
@@ -971,86 +931,297 @@ fn http_get(url: &str) -> Result<String, String> {
     Err("http GET failed: no curl/powershell available or all attempts failed".into())
 }
 
-fn check_update_once(app: &tauri::AppHandle) {
+/// Minimal HTTP GET that follows redirects but returns only the final URL
+/// (`%{url_effective}`), discarding the body. Used by the update check to hit
+/// GitHub's HTML `/releases/latest` page — a plain 302 to the newest release —
+/// which does NOT consume the GitHub API quota. Timeout 9s, silent failure.
+fn http_get_final_url(url: &str) -> Result<String, String> {
+    let curl_candidates: &[&str] = &["curl", "curl.exe"];
+    for bin in curl_candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "-sL",
+            "--max-time",
+            "9",
+            "-H",
+            "User-Agent: deepseek-harness-desktop",
+            "-o",
+            "NUL",
+            "-w",
+            "%{url_effective}",
+            url,
+        ]);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8(out.stdout).map_err(|e| format!("utf8: {e}"))?;
+                let s = s.trim();
+                if s.is_empty() {
+                    return Err("empty url_effective from curl".into());
+                }
+                return Ok(s.to_string());
+            }
+            Ok(out) => {
+                let code = out.status.code().unwrap_or(-1);
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                log_line(&format!(
+                    "curl {bin} (final-url) failed code={code} stderr={stderr}"
+                ));
+                // try next candidate / fallback
+                continue;
+            }
+            Err(_) => continue,
+        }
+    }
+    // PowerShell fallback on Windows (follows redirects; read the final URI).
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = url.replace('\'', "''");
+        let ps_script = format!(
+            "$ProgressPreference='SilentlyContinue'; try {{ $r = Invoke-WebRequest -Uri '{escaped}' -Headers @{{'User-Agent'='deepseek-harness-desktop'}} -TimeoutSec 9 -UseBasicParsing; $r.BaseResponse.RequestMessage.RequestUri.AbsoluteUri }} catch {{ Write-Error $_.Exception.Message; exit 1 }}"
+        );
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", &ps_script]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let s = String::from_utf8(out.stdout).map_err(|e| format!("utf8: {e}"))?;
+                if !s.trim().is_empty() {
+                    return Ok(s.trim().to_string());
+                }
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("powershell Invoke-WebRequest failed: {stderr}"));
+        }
+    }
+    Err("final-url GET failed: no curl/powershell available or all attempts failed".into())
+}
+
+/// Extract the release tag from a final "latest" URL like
+/// `https://github.com/<owner>/<repo>/releases/tag/v0.1.7`. Returns `None`
+/// when the URL has no tag (e.g. a repo with no releases redirects to
+/// `/releases` instead).
+fn parse_tag_from_release_url(final_url: &str) -> Option<String> {
+    let marker = "/releases/tag/";
+    let idx = final_url.find(marker)?;
+    let rest = &final_url[idx + marker.len()..];
+    let tag = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+fn truncate_notes(body: &str) -> String {
+    if body.chars().count() > 2000 {
+        let truncated: String = body.chars().take(2000).collect();
+        format!("{truncated}…")
+    } else {
+        body.to_string()
+    }
+}
+
+/// Release notes, best-effort. Only called when a new version is detected, so
+/// the GitHub API (60 req/h/IP unauthenticated) is barely touched; a failed or
+/// rate-limited call degrades to empty notes and is only logged — it never
+/// blocks the update banner.
+fn fetch_release_notes() -> String {
+    let text = match http_get(DEFAULT_API_ENDPOINT) {
+        Ok(t) => t,
+        Err(e) => {
+            log_line(&format!(
+                "update check: release notes fetch failed (best-effort): {e}"
+            ));
+            return String::new();
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            log_line(&format!(
+                "update check: release notes parse failed (best-effort): {e}"
+            ));
+            return String::new();
+        }
+    };
+    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+    if body.is_empty() {
+        let msg = v
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("no body");
+        log_line(&format!("update check: release notes empty ({msg})"));
+        return String::new();
+    }
+    truncate_notes(body)
+}
+
+/// Compare `tag` against the running version; when newer (and not ignored),
+/// cache and emit `dsh-update-available`. `notes` is optional — when `None`,
+/// release notes are fetched best-effort from the GitHub API. Returns true
+/// when an update was announced.
+fn maybe_announce_update(
+    app: &tauri::AppHandle,
+    cache: &Arc<Mutex<Option<serde_json::Value>>>,
+    tag: &str,
+    release_url: &str,
+    ignored: Option<&str>,
+    notes: Option<String>,
+) -> bool {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest_stripped = tag.trim_start_matches('v').trim_start_matches('V');
+    let current_stripped = current.trim_start_matches('v').trim_start_matches('V');
+    if !is_newer_version(current_stripped, latest_stripped) {
+        log_line(&format!(
+            "update check: no new version (current {current}, latest {tag})"
+        ));
+        return false;
+    }
+    if let Some(ig) = ignored {
+        if ig == tag {
+            log_line(&format!("update check: ignored version {tag} skipped"));
+            return false;
+        }
+    }
+    let notes = notes.unwrap_or_else(fetch_release_notes);
+    let payload = serde_json::json!({
+        "version": tag,
+        "current": current,
+        "url": DEFAULT_UPDATE_URL,
+        "releaseUrl": release_url,
+        "notes": notes,
+    });
+    log_line(&format!("update available: {tag} (current {current})"));
+    *cache.lock().unwrap() = Some(payload.clone());
+    let _ = app.emit("dsh-update-available", payload);
+    true
+}
+
+/// Open a URL in the system default browser. The update banner's "前往下载"
+/// button cannot use `window.open` (swallowed by the embedded WebView2), so
+/// the page emits `dsh-update-open` and this opens it with the OS instead.
+fn open_url_in_browser(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        log_line(&format!("open url refused (non-http(s)): {url}"));
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `rundll32 url.dll,FileProtocolHandler` opens the URL with the system
+        // default browser. No shell is involved, so there are none of the
+        // quoting pitfalls of `cmd /C start "" "url"` (which mangles the URL
+        // when Rust re-quotes the argument).
+        let mut cmd = Command::new("rundll32");
+        cmd.args(["url.dll,FileProtocolHandler", url]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        if let Err(e) = cmd.spawn() {
+            log_line(&format!("open url failed (rundll32): {e}"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = Command::new("open").arg(url).spawn() {
+            log_line(&format!("open url failed (open): {e}"));
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Err(e) = Command::new("xdg-open").arg(url).spawn() {
+            log_line(&format!("open url failed (xdg-open): {e}"));
+        }
+    }
+}
+
+fn check_update_once(app: &tauri::AppHandle, cache: Arc<Mutex<Option<serde_json::Value>>>) {
     let settings = read_desktop_settings();
     if !settings.update_check {
         log_line("update check: skipped (updateCheck=false)");
         return;
     }
-    let interval_secs = settings.update_interval_hours.saturating_mul(3600);
-    if interval_secs > 0 {
-        if let Some(last) = settings.last_update_check {
-            let now = now_unix_secs();
-            if now >= last && now.saturating_sub(last) < interval_secs {
-                log_line(&format!(
-                    "update check: throttled (last {}s ago, <{}h)",
-                    now - last,
-                    settings.update_interval_hours
-                ));
-                return;
-            }
-        }
-    }
     let endpoint = settings.update_endpoint.clone();
     let ignored = settings.ignored_update.clone();
-    log_line(&format!("update check: GET {endpoint}"));
+    log_line(&format!("update check: GET {endpoint} (HTML latest page)"));
     let result: Result<(), String> = (|| {
-        let text = http_get(&endpoint)?;
-        let v: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("json parse: {e}"))?;
-        let tag = v
-            .get("tag_name")
-            .and_then(|x| x.as_str())
-            .ok_or("missing tag_name")?;
-        let html_url = v
-            .get("html_url")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
-        let current = env!("CARGO_PKG_VERSION");
-        let latest_stripped = tag.trim_start_matches('v').trim_start_matches('V');
-        let current_stripped = current.trim_start_matches('v').trim_start_matches('V');
-        if !is_newer_version(current_stripped, latest_stripped) {
-            log_line(&format!(
-                "update check: no new version (current {current}, latest {tag})"
-            ));
-            return Ok(());
-        }
-        if let Some(ref ig) = ignored {
-            if ig == tag {
-                log_line(&format!("update check: ignored version {tag} skipped"));
-                return Ok(());
+        // Primary route: GitHub's HTML /releases/latest — a plain 302 to the
+        // newest release tag — which does NOT consume the GitHub API quota, so
+        // checks can no longer be silently killed by rate limiting.
+        match http_get_final_url(&endpoint) {
+            Ok(final_url) => {
+                log_line(&format!("update check: latest release URL -> {final_url}"));
+                match parse_tag_from_release_url(&final_url) {
+                    Some(tag) => {
+                        maybe_announce_update(
+                            app,
+                            &cache,
+                            &tag,
+                            &final_url,
+                            ignored.as_deref(),
+                            None,
+                        );
+                    }
+                    None => log_line(&format!(
+                        "update check: no release found (final URL has no /releases/tag/): {final_url}"
+                    )),
+                }
+            }
+            Err(html_err) => {
+                // Fallback route: the old JSON API (only when the HTML route
+                // fails, e.g. github.com unreachable but api.github.com works).
+                // It may itself be rate-limited — then it degrades to a clear,
+                // logged no-op rather than a silent failure.
+                log_line(&format!(
+                    "update check: HTML route failed ({html_err}); falling back to API"
+                ));
+                let text = http_get(DEFAULT_API_ENDPOINT)?;
+                let v: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|e| format!("json parse: {e}"))?;
+                let tag = v
+                    .get("tag_name")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| {
+                        let msg = v
+                            .get("message")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown");
+                        if msg.contains("rate limit") {
+                            "GitHub API rate limited (anonymous quota 60/h/IP exhausted; the HTML route is the primary check and is not affected)".to_string()
+                        } else {
+                            format!("missing tag_name (API error response: {msg})")
+                        }
+                    })?;
+                let html_url = v
+                    .get("html_url")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let release_url = if html_url.is_empty() {
+                    format!("{DEFAULT_UPDATE_URL}/releases/tag/{tag}")
+                } else {
+                    html_url.to_string()
+                };
+                let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+                let notes = truncate_notes(body);
+                maybe_announce_update(
+                    app,
+                    &cache,
+                    tag,
+                    &release_url,
+                    ignored.as_deref(),
+                    Some(notes),
+                );
             }
         }
-        let notes = if body.chars().count() > 2000 {
-            let truncated: String = body.chars().take(2000).collect();
-            format!("{truncated}…")
-        } else {
-            body.to_string()
-        };
-        let release_url = if html_url.is_empty() {
-            format!("{DEFAULT_UPDATE_URL}/releases/tag/{tag}")
-        } else {
-            html_url.to_string()
-        };
-        let payload = serde_json::json!({
-            "version": tag,
-            "current": current,
-            "url": DEFAULT_UPDATE_URL,
-            "releaseUrl": release_url,
-            "notes": notes,
-        });
-        log_line(&format!("update available: {tag} (current {current})"));
-        let _ = app.emit("dsh-update-available", payload);
         Ok(())
     })();
     if let Err(e) = result {
         log_line(&format!("update check failed (silent): {e}"));
-    }
-    if let Err(e) = persist_last_update_check() {
-        log_line(&format!("update check: persist lastUpdateCheck failed: {e}"));
-    } else {
-        log_line("update check: lastUpdateCheck updated");
     }
 }
 
@@ -1186,12 +1357,23 @@ fn main() {
                 });
             }
 
-            // GitHub update check: once per launch, throttled to 24h, silent failure.
-            // Runs in parallel with dsh spawn; all errors only log_line.
+            // GitHub update check: once per launch (every launch, no interval
+            // config — the HTML endpoint is quota-free so checking is cheap),
+            // silent failure. Runs in parallel with dsh spawn; all errors only
+            // log_line.
+            //
+            // The result is cached here so it can be re-emitted from on_page_load
+            // (below): the check finishes on a background thread while the window
+            // is still on the placeholder page, and a one-shot event would race
+            // the banner listener on the real harness page. Re-emitting the
+            // cached payload on every page-load "Finished" guarantees the banner
+            // always receives it.
+            let update_cache: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
             {
                 let update_app = app.handle().clone();
+                let update_cache_thread = update_cache.clone();
                 std::thread::spawn(move || {
-                    check_update_once(&update_app);
+                    check_update_once(&update_app, update_cache_thread);
                 });
                 app.handle().listen("dsh-update-ignore", move |event| {
                     let payload_str = event.payload();
@@ -1227,6 +1409,39 @@ fn main() {
                         ));
                     }
                 });
+                // Open the release download URL in the system default browser
+                // (the banner's "前往下载" button — window.open is swallowed by
+                // the embedded WebView2, so the page routes through this event).
+                app.handle().listen("dsh-update-open", move |event| {
+                    let payload_str = event.payload();
+                    let url_opt: Option<String> = (|| {
+                        let v: serde_json::Value = serde_json::from_str(payload_str).ok()?;
+                        let inner = match v {
+                            serde_json::Value::String(s) => {
+                                serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::String(s))
+                            }
+                            other => other,
+                        };
+                        if let Some(s) = inner.as_str() {
+                            return Some(s.to_string());
+                        }
+                        if let Some(obj) = inner.as_object() {
+                            if let Some(u) = obj.get("url").and_then(|x| x.as_str()) {
+                                return Some(u.to_string());
+                            }
+                        }
+                        None
+                    })();
+                    match url_opt {
+                        Some(url) => {
+                            log_line(&format!("update check: opening download URL: {url}"));
+                            open_url_in_browser(&url);
+                        }
+                        None => log_line(&format!(
+                            "update check: dsh-update-open bad payload: {payload_str}"
+                        )),
+                    }
+                });
             }
 
             // Create the main window in code so the custom titlebar controls
@@ -1251,11 +1466,13 @@ fn main() {
             if let Some(panel_js) = usage_panel_js {
                 window_builder = window_builder.initialization_script(panel_js);
             }
+            let update_cache_load = update_cache.clone();
+            let update_app_load = app.handle().clone();
             let window_builder = window_builder
                     // Log every page load (placeholder page AND the harness URL) so
                     // the log confirms the WebView actually reached the dsh UI —
                     // if navigation fails, the harness URL never appears here.
-                    .on_page_load(|_window, payload| {
+                    .on_page_load(move |_window, payload| {
                         let url = payload.url().to_string();
                         match payload.event() {
                             tauri::webview::PageLoadEvent::Started => {
@@ -1263,6 +1480,12 @@ fn main() {
                             }
                             tauri::webview::PageLoadEvent::Finished => {
                                 log_line(&format!("page load finished: {url}"));
+                                // Re-emit a cached update result so the banner
+                                // listener on THIS page always gets it, even when
+                                // the check completed before this page loaded.
+                                if let Some(cached) = update_cache_load.lock().unwrap().clone() {
+                                    let _ = update_app_load.emit("dsh-update-available", cached);
+                                }
                             }
                         }
                     });

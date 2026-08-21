@@ -18,6 +18,15 @@
 
   function openUrl(url) {
     try {
+      // The embedded WebView2 swallows window.open, so route through Rust:
+      // emit dsh-update-open and let the backend open the system default
+      // browser (see the dsh-update-open listener in main.rs).
+      if (Tauri.event && Tauri.event.emit) {
+        Tauri.event.emit('dsh-update-open', { url }).catch(() => {})
+        return
+      }
+    } catch {}
+    try {
       window.open(url, '_blank')
     } catch {}
   }

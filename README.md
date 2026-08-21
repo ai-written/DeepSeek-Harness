@@ -30,7 +30,7 @@ npm run build    # 打包 release
 - **启动日志**：所有关键步骤与 dsh 的 stderr 写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP），"双击没反应"可从这里排查
 - **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）
 - **兼容新旧 dsh**：自动探测 `--no-open` 支持——新版 dsh 不弹系统浏览器；旧版自动回退（仅可能弹出浏览器，不影响使用）
-- **更新提示**：启动时一次性检查 GitHub 最新版本（可配置间隔，默认 24 小时节流、静默失败、可配置更新源），有新版顶部横幅提示下载
+- **更新提示**：每次启动检查 GitHub 最新版本（走 HTML 页面重定向，不占用 GitHub API 配额、静默失败、可配置更新源），有新版顶部横幅提示下载；点击"忽略此版本"后该版本不再提示
 - **干净退出**：关闭窗口即杀掉 dsh 整棵进程树，无残留
 
 ## 开发注意
@@ -45,7 +45,7 @@ npm run build    # 打包 release
 - 未设置 `$DSH_HOME` 时：`~/.dsh/storages/desktop-settings.json`
 
 ```json
-{ "decorations": true, "usageBadge": true, "updateCheck": true, "updateCheckIntervalHours": 24 }
+{ "decorations": true, "usageBadge": true, "updateCheck": true }
 ```
 
 | 字段 | 默认 | 说明 |
@@ -53,11 +53,10 @@ npm run build    # 打包 release
 | `decorations` | `false` | `true` 时改用系统原生标题栏（隐藏自定义最小化/最大化/关闭按钮）；**重启应用生效** |
 | `usageBadge` | `true` | `false` 时**整个金额统计功能关闭**：不显示左下角 ¥ 胶囊、不启动统计 sidecar（无实时更新）、不注入统计弹窗 |
 | `updateCheck` | `true` | 是否在启动时检查 GitHub 更新；`false` 则跳过网络请求 |
-| `updateCheckIntervalHours` | `24` | 检查间隔（小时），`0` 表示每次启动都检查；默认 24 小时节流 |
-| `updateEndpoint` | GitHub API | 自定义更新源，默认 `https://api.github.com/repos/ai-written/DeepSeek-Harness/releases/latest`，可改为镜像 |
-| `ignoredUpdate` | — | 已忽略的版本（如 `v0.1.6`），由“忽略此版本”按钮写入；`lastUpdateCheck` 为上次检查时间戳（自动维护） |
+| `updateEndpoint` | HTML latest 页 | 自定义更新源，默认 `https://github.com/ai-written/DeepSeek-Harness/releases/latest`（HTML 重定向，不占 API 配额），可改为镜像 |
+| `ignoredUpdate` | — | 已忽略的版本（如 `v0.1.6`），由"忽略此版本"按钮写入 |
 
-> 启动为**一次性检查、可配置间隔（默认 24 小时节流）、静默失败**：后台线程 9 秒超时请求，失败仅写日志；有新版本时顶部弹出横幅（前往下载 / 忽略此版本）。`updateCheckIntervalHours: 0` 可改为每次启动都检查。
+> 每次启动检查一次、静默失败：后台线程 9 秒超时，先请求 HTML 的 `/releases/latest` 页面（302 重定向到最新 tag，**不消耗 GitHub API 配额**），失败时回退 GitHub API；有新版本时顶部弹出横幅（前往下载 / 忽略此版本），每次启动都会弹出（点 × 仅关闭本次），点击"忽略此版本"后该版本不再提示。发布说明（notes）尽力从 API 获取，失败时横幅照常弹出但无备注文字。
 > **生效检查**：日志会打印 `update check` / `native window decorations` / `usage badge` 等行。
 
 同目录的 `usage-pricing.json` 是计费价格/汇率配置（见「每日用量徽标」）。
