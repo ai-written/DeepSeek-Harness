@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-harness"
-version = "0.1.5"
+version = "0.1.6"
 description = "DeepSeek-Harness — Tauri desktop shell embedding the DeepSeek Harness web UI (dsh web)"
 edition = "2021"
 

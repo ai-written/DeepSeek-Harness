@@ -15,8 +15,17 @@ import { readFileSync, existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { syncVersion } from './sync-version.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+// Ensure Cargo.toml / tauri.conf.json follow package.json before build.
+try {
+  syncVersion()
+} catch (e) {
+  console.warn(`[sync-version] failed: ${e.message}`)
+}
+
 const keyPath = path.join(root, '.tauri', 'deepseek-harness.key')
 const pwPath = path.join(root, '.tauri', 'key-password.txt')
 
