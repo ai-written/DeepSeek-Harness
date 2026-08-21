@@ -722,7 +722,10 @@ fn ensure_desktop_settings() {
             return;
         }
     }
-    match std::fs::write(&path, "{\n  \"decorations\": false,\n  \"usageBadge\": true\n}\n") {
+    match std::fs::write(
+        &path,
+        "{\n  \"decorations\": false,\n  \"usageBadge\": true,\n  \"updateCheck\": true,\n  \"updateCheckIntervalHours\": 24\n}\n",
+    ) {
         Ok(()) => log_line(&format!(
             "desktop-settings.json created with defaults -> {}",
             path.display()
@@ -734,6 +737,11 @@ fn ensure_desktop_settings() {
     }
 }
 
+/// Default GitHub releases endpoint for update checks.
+const DEFAULT_UPDATE_ENDPOINT: &str =
+    "https://api.github.com/repos/ai-written/DeepSeek-Harness/releases/latest";
+const DEFAULT_UPDATE_URL: &str = "https://github.com/ai-written/DeepSeek-Harness";
+
 /// Parsed `desktop-settings.json` (auto-created with defaults on first launch).
 struct DesktopSettings {
     /// Use the native system titlebar instead of the custom injected one.
@@ -741,32 +749,309 @@ struct DesktopSettings {
     /// Show the daily-usage badge (¥ amount pill + stats dialog) and run the
     /// usage sidecar that feeds it real-time data.
     usage_badge: bool,
+    /// Whether to perform GitHub update checks. Default true.
+    update_check: bool,
+    /// Override endpoint for update checks. Default is DEFAULT_UPDATE_ENDPOINT.
+    update_endpoint: String,
+    /// Interval between update checks in hours. 0 = every launch. Default 24.
+    update_interval_hours: u64,
+    /// Last update check unix seconds.
+    last_update_check: Option<u64>,
+    /// Ignored update version tag (e.g. "v0.1.6").
+    ignored_update: Option<String>,
 }
 
 /// Read `desktop-settings.json` under the dsh storages dir, applying defaults
-/// for any missing/unknown field: `decorations` = false, `usageBadge` = true.
+/// for any missing/unknown field: `decorations` = false, `usageBadge` = true,
+/// `updateCheck` = true, etc.
 fn read_desktop_settings() -> DesktopSettings {
     ensure_desktop_settings();
     let value = std::fs::read_to_string(dsh_storages_file("desktop-settings.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let get = |key: &str, default: bool| {
+    let get_bool = |key: &str, default: bool| {
         value
             .as_ref()
             .and_then(|v| v.get(key))
             .and_then(|v| v.as_bool())
             .unwrap_or(default)
     };
+    let update_endpoint = value
+        .as_ref()
+        .and_then(|v| v.get("updateEndpoint"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DEFAULT_UPDATE_ENDPOINT.to_string());
+    let last_update_check = value
+        .as_ref()
+        .and_then(|v| v.get("lastUpdateCheck"))
+        .and_then(|v| v.as_u64());
+    let ignored_update = value
+        .as_ref()
+        .and_then(|v| v.get("ignoredUpdate"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let update_interval_hours = value
+        .as_ref()
+        .and_then(|v| v.get("updateCheckIntervalHours"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(24);
     let settings = DesktopSettings {
-        native_decorations: get("decorations", false),
-        usage_badge: get("usageBadge", true),
+        native_decorations: get_bool("decorations", false),
+        usage_badge: get_bool("usageBadge", true),
+        update_check: get_bool("updateCheck", true),
+        update_endpoint,
+        update_interval_hours,
+        last_update_check,
+        ignored_update,
     };
     log_line(&format!(
         "native window decorations (desktop-settings.json): {}",
         settings.native_decorations
     ));
     log_line(&format!("usage badge (desktop-settings.json): {}", settings.usage_badge));
+    log_line(&format!("update check (desktop-settings.json): {}", settings.update_check));
+    log_line(&format!("update endpoint: {}", settings.update_endpoint));
+    log_line(&format!(
+        "update interval: {}h",
+        settings.update_interval_hours
+    ));
+    if let Some(ts) = settings.last_update_check {
+        log_line(&format!("lastUpdateCheck: {ts}"));
+    }
+    if let Some(ref ig) = settings.ignored_update {
+        log_line(&format!("ignoredUpdate: {ig}"));
+    }
     settings
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn persist_last_update_check() -> Result<(), String> {
+    let path = dsh_storages_file("desktop-settings.json");
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    let now = now_unix_secs();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("lastUpdateCheck".to_string(), serde_json::Value::Number(now.into()));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let pretty = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn persist_ignored_update(version: &str) -> Result<(), String> {
+    let path = dsh_storages_file("desktop-settings.json");
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("ignoredUpdate".to_string(), serde_json::Value::String(version.to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let pretty = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pretty).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn parse_version_core(v: &str) -> (Vec<u64>, Option<String>) {
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p.to_string())),
+        None => (v, None),
+    };
+    let nums = core
+        .split('.')
+        .map(|s| s.parse::<u64>().unwrap_or(0))
+        .collect();
+    (nums, pre)
+}
+
+/// Return true if `latest` > `current` (both without leading `v`).
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let (cur_nums, cur_pre) = parse_version_core(current);
+    let (lat_nums, lat_pre) = parse_version_core(latest);
+    let max_len = cur_nums.len().max(lat_nums.len());
+    for i in 0..max_len {
+        let c = *cur_nums.get(i).unwrap_or(&0);
+        let l = *lat_nums.get(i).unwrap_or(&0);
+        if l > c {
+            return true;
+        }
+        if l < c {
+            return false;
+        }
+    }
+    match (cur_pre, lat_pre) {
+        (None, None) => false,
+        (None, Some(_)) => false, // prerelease < release
+        (Some(_), None) => true,  // release > prerelease
+        (Some(cp), Some(lp)) => lp > cp, // lexical
+    }
+}
+
+/// Minimal HTTP GET using system `curl` (and PowerShell fallback on Windows),
+/// so the update check needs no extra Rust TLS crates. Timeout 9s, silent failure.
+fn http_get(url: &str) -> Result<String, String> {
+    // Try curl first (present on modern Windows, macOS, linux)
+    let curl_candidates: &[&str] = &["curl", "curl.exe"];
+    for bin in curl_candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args([
+            "-sL",
+            "--max-time",
+            "9",
+            "-H",
+            "User-Agent: deepseek-harness-desktop",
+            "-H",
+            "Accept: application/vnd.github+json",
+            url,
+        ]);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8(out.stdout).map_err(|e| format!("utf8: {e}"))?;
+                if s.trim().is_empty() {
+                    return Err("empty response from curl".into());
+                }
+                return Ok(s);
+            }
+            Ok(out) => {
+                let code = out.status.code().unwrap_or(-1);
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                log_line(&format!("curl {bin} failed code={code} stderr={stderr}"));
+                // try next candidate / fallback
+                continue;
+            }
+            Err(_) => continue,
+        }
+    }
+    // PowerShell fallback on Windows
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = url.replace('\'', "''");
+        let ps_script = format!(
+            "$ProgressPreference='SilentlyContinue'; try {{ $r = Invoke-WebRequest -Uri '{escaped}' -Headers @{{'User-Agent'='deepseek-harness-desktop'; 'Accept'='application/vnd.github+json'}} -TimeoutSec 9 -UseBasicParsing; $r.Content }} catch {{ Write-Error $_.Exception.Message; exit 1 }}"
+        );
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", &ps_script]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Ok(out) = cmd.output() {
+            if out.status.success() {
+                let s = String::from_utf8(out.stdout).map_err(|e| format!("utf8: {e}"))?;
+                if !s.trim().is_empty() {
+                    return Ok(s);
+                }
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("powershell Invoke-WebRequest failed: {stderr}"));
+        }
+    }
+    Err("http GET failed: no curl/powershell available or all attempts failed".into())
+}
+
+fn check_update_once(app: &tauri::AppHandle) {
+    let settings = read_desktop_settings();
+    if !settings.update_check {
+        log_line("update check: skipped (updateCheck=false)");
+        return;
+    }
+    let interval_secs = settings.update_interval_hours.saturating_mul(3600);
+    if interval_secs > 0 {
+        if let Some(last) = settings.last_update_check {
+            let now = now_unix_secs();
+            if now >= last && now.saturating_sub(last) < interval_secs {
+                log_line(&format!(
+                    "update check: throttled (last {}s ago, <{}h)",
+                    now - last,
+                    settings.update_interval_hours
+                ));
+                return;
+            }
+        }
+    }
+    let endpoint = settings.update_endpoint.clone();
+    let ignored = settings.ignored_update.clone();
+    log_line(&format!("update check: GET {endpoint}"));
+    let result: Result<(), String> = (|| {
+        let text = http_get(&endpoint)?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("json parse: {e}"))?;
+        let tag = v
+            .get("tag_name")
+            .and_then(|x| x.as_str())
+            .ok_or("missing tag_name")?;
+        let html_url = v
+            .get("html_url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+        let current = env!("CARGO_PKG_VERSION");
+        let latest_stripped = tag.trim_start_matches('v').trim_start_matches('V');
+        let current_stripped = current.trim_start_matches('v').trim_start_matches('V');
+        if !is_newer_version(current_stripped, latest_stripped) {
+            log_line(&format!(
+                "update check: no new version (current {current}, latest {tag})"
+            ));
+            return Ok(());
+        }
+        if let Some(ref ig) = ignored {
+            if ig == tag {
+                log_line(&format!("update check: ignored version {tag} skipped"));
+                return Ok(());
+            }
+        }
+        let notes = if body.chars().count() > 2000 {
+            let truncated: String = body.chars().take(2000).collect();
+            format!("{truncated}…")
+        } else {
+            body.to_string()
+        };
+        let release_url = if html_url.is_empty() {
+            format!("{DEFAULT_UPDATE_URL}/releases/tag/{tag}")
+        } else {
+            html_url.to_string()
+        };
+        let payload = serde_json::json!({
+            "version": tag,
+            "current": current,
+            "url": DEFAULT_UPDATE_URL,
+            "releaseUrl": release_url,
+            "notes": notes,
+        });
+        log_line(&format!("update available: {tag} (current {current})"));
+        let _ = app.emit("dsh-update-available", payload);
+        Ok(())
+    })();
+    if let Err(e) = result {
+        log_line(&format!("update check failed (silent): {e}"));
+    }
+    if let Err(e) = persist_last_update_check() {
+        log_line(&format!("update check: persist lastUpdateCheck failed: {e}"));
+    } else {
+        log_line("update check: lastUpdateCheck updated");
+    }
 }
 
 /// Read the current pricing config as text, for the edit dialog in the panel.
@@ -851,6 +1136,8 @@ fn main() {
     } else {
         None
     };
+    // Update banner (always injected; Rust side decides whether to emit).
+    let update_banner_js = include_str!("../update-banner.js");
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -899,6 +1186,49 @@ fn main() {
                 });
             }
 
+            // GitHub update check: once per launch, throttled to 24h, silent failure.
+            // Runs in parallel with dsh spawn; all errors only log_line.
+            {
+                let update_app = app.handle().clone();
+                std::thread::spawn(move || {
+                    check_update_once(&update_app);
+                });
+                app.handle().listen("dsh-update-ignore", move |event| {
+                    let payload_str = event.payload();
+                    let version_opt: Option<String> = (|| {
+                        let v: serde_json::Value = serde_json::from_str(payload_str).ok()?;
+                        let inner = match v {
+                            serde_json::Value::String(s) => {
+                                serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::String(s))
+                            }
+                            other => other,
+                        };
+                        if let Some(s) = inner.as_str() {
+                            return Some(s.to_string());
+                        }
+                        if let Some(obj) = inner.as_object() {
+                            if let Some(ver) = obj.get("version").and_then(|x| x.as_str()) {
+                                return Some(ver.to_string());
+                            }
+                            if let Some(ver) = obj.get("ignoredUpdate").and_then(|x| x.as_str()) {
+                                return Some(ver.to_string());
+                            }
+                        }
+                        None
+                    })();
+                    if let Some(ver) = version_opt {
+                        match persist_ignored_update(&ver) {
+                            Ok(()) => log_line(&format!("update check: ignored version set to {ver}")),
+                            Err(e) => log_line(&format!("update check: persist ignoredUpdate failed: {e}")),
+                        }
+                    } else {
+                        log_line(&format!(
+                            "update check: dsh-update-ignore bad payload: {payload_str}"
+                        ));
+                    }
+                });
+            }
+
             // Create the main window in code so the custom titlebar controls
             // can be injected as an initialization script (runs on the
             // placeholder page AND after navigate to the harness URL).
@@ -915,7 +1245,8 @@ fn main() {
                     .center()
                     .resizable(true)
                     .decorations(native_decorations)
-                    .initialization_script(controls_js);
+                    .initialization_script(controls_js)
+                    .initialization_script(update_banner_js);
             // Usage badge panel: only injected when enabled in desktop-settings.
             if let Some(panel_js) = usage_panel_js {
                 window_builder = window_builder.initialization_script(panel_js);
