@@ -26,7 +26,7 @@
   const panel = document.createElement('div')
   panel.id = 'deepseek-harness-usage'
   panel.style.cssText =
-    'position:fixed;left:76px;bottom:16px;z-index:2147483646;' +
+    'position:fixed;left:76px;bottom:14px;z-index:2147483646;' +
     'display:inline-block;padding:5px 14px 5px 10px;border-radius:999px;' +
     'background:linear-gradient(180deg,#ffffff,#f3f5f8);color:#1f2328;white-space:nowrap;' +
     'border:1px solid #d0d7de;' +

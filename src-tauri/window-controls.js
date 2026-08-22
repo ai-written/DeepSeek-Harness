@@ -33,6 +33,9 @@
   // the custom caption bar below; only the startup-progress forwarding stays.
   const NATIVE = !!window.__deepseekHarnessNativeDecorations
   let bar = null
+  // Header-utilities nudge <style>; created only for the custom titlebar
+  // (below) but appended from mount(), so it lives in this outer scope.
+  let nudgeStyle = null
 
   // Decide whether the caption buttons need dark icons (light page) or light
   // icons (dark page) by sampling the page's actual background luminance.
@@ -54,7 +57,7 @@
   }
 
   if (!NATIVE) {
-  const BAR_HEIGHT = 38
+  const BAR_HEIGHT = 26
   const BTN_W = 46
 
   // Container pinned to the top of the page. It must float above the harness
@@ -67,6 +70,16 @@
     '-webkit-user-select:none;user-select:none;' +
     'background:transparent;'
 
+  // Nudge the harness UI's own top-right header utilities (the "Session log"
+  // button container, generated class like wSkVaW_headerUtilities) down so it
+  // clears the caption buttons pinned above it. Matched by class-name
+  // substring because the leading hash of the generated class can change
+  // between harness builds; !important wins over the late-loading page CSS
+  // (this script runs before the page's own stylesheets).
+  nudgeStyle = document.createElement('style')
+  nudgeStyle.id = 'deepseek-harness-header-nudge'
+  nudgeStyle.textContent =
+    '[class*="headerUtilities"]{position:relative !important;top:18px !important;}'
   // Drag region: left part of the bar (buttons stay interactive on the right).
   const drag = document.createElement('div')
   drag.style.cssText =
@@ -235,6 +248,10 @@
         document.body.appendChild(bar)
         // Push harness content down so it isn't hidden under the transparent
         // bar's drag strip; the buttons themselves sit on top of content.
+      }
+      // Drop the header-utilities nudge style (idempotent per document).
+      if (!document.getElementById('deepseek-harness-header-nudge')) {
+        document.head.appendChild(nudgeStyle)
       }
       // Initial caption-button color: match the page's actual background
       // luminance (light page → dark icons, dark page → light icons).
