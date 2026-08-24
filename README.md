@@ -81,10 +81,20 @@ npm run build
 
 ## 每日用量徽标
 
-主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日用量图表（含金额、token、缓存命中率合计），并编辑汇率与单价。
+主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日用量图表（含金额、token、请求数、缓存命中率合计），并编辑汇率与单价。
 
 - **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 zstd），每 3 秒增量刷新；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染
-- **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率与峰谷时段计价；sidecar 每次刷新重读，改动即时生效
+- **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率与峰时时段计价；sidecar 每次刷新重读，改动即时生效
+
+峰时档位（`timeOfUse`）可选字段 `days` 限定峰时适用日期，缺省 `all`（每天，行为与旧版一致）：
+
+```json
+"timeOfUse": { "enabled": true, "days": "weekday", "peakMultiplier": 2, "valleyMultiplier": 1, "peakRanges": [[9, 12], [14, 18]] }
+```
+
+- `days`：`"all"`（默认）| `"weekday"`（周一至周五）| `"weekend"`（周六、周日）| 整数数组如 `[1,2,3,4,5]`（1=周一 … 7=周日）
+- 语义：**不匹配的日期按原价（倍率 1）**，当天峰时配置不生效；匹配的日期内，落在 `peakRanges` 的小时按 `peakMultiplier`（峰时倍率，按不低于 ×1 计，填 0/负数等同 1），其余小时按 `valleyMultiplier`（谷时倍率，界面固定为 1，即原价）
+- 法定节假日暂不特殊处理，按普通工作日计
 - **只读与降级**：sidecar 只读日志、不写会话文件；脚本缺失或 node 不可用时仅日志告警，不影响主功能
 - **打包**：脚本作为资源打进安装包（从 `resource_dir()` 定位），同时以 `include_str!` 嵌入 exe 本体——免安装版找不到外部脚本时会自动解压到 `%LOCALAPPDATA%\deepseek-harness\` 再运行
 

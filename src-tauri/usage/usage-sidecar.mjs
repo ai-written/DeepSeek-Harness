@@ -151,12 +151,12 @@ function modelMultiplier(pricing, provider, model) {
 /// Cost of one hour's tokens for a bucket: that hour's time-of-use multiplier
 /// and the model multiplier applied. Shared by costUsd (bucket total) and the
 /// per-hour series emitted to the panel's day view.
-function hourlyCostUsd(bucket, hour, pricing) {
+function hourlyCostUsd(bucket, hour, pricing, weekday = flatWeekday()) {
   const p = resolvePrice(pricing, bucket.provider, bucket.model);
   const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
   const m = bucket.hourly?.[hour];
   if (!m) return 0;
-  const mult = multiplierFor(hour, modelTimeOfUse(pricing, bucket.provider, bucket.model));
+  const mult = multiplierFor(weekday, hour, modelTimeOfUse(pricing, bucket.provider, bucket.model));
   return (
     ((m.input / 1e6) * p.inputPerMillion +
       (m.cacheRead / 1e6) * p.cacheReadPerMillion +
@@ -167,19 +167,19 @@ function hourlyCostUsd(bucket, hour, pricing) {
   );
 }
 
-function costUsd(bucket, pricing) {
+function costUsd(bucket, pricing, weekday = flatWeekday()) {
   // If the bucket carries hourly token splits, price per hour so peak/valley
   // time-of-use multipliers apply; otherwise fall back to flat pricing.
   const h = bucket.hourly;
   if (h && Array.isArray(h) && h.length === 24) {
     let total = 0;
-    for (let hour = 0; hour < 24; hour++) total += hourlyCostUsd(bucket, hour, pricing);
+    for (let hour = 0; hour < 24; hour++) total += hourlyCostUsd(bucket, hour, pricing, weekday);
     return total;
   }
   const p = resolvePrice(pricing, bucket.provider, bucket.model);
   const tou = modelTimeOfUse(pricing, bucket.provider, bucket.model);
   const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
-  const mult = multiplierFor(flatHour(), tou);
+  const mult = multiplierFor(flatWeekday(), flatHour(), tou);
   return (
     ((bucket.input / 1e6) * p.inputPerMillion +
       (bucket.cacheRead / 1e6) * p.cacheReadPerMillion +
@@ -202,16 +202,48 @@ function localHour(ms) {
 function flatHour() {
   return new Date().getHours(); // approximate for buckets without hourly splits
 }
+/// Weekday 1=Monday … 7=Sunday from a JS Date (getDay(): 0=Sunday … 6=Saturday).
+function weekdayOf(d) {
+  return (d.getDay() + 6) % 7 + 1;
+}
+function flatWeekday() {
+  return weekdayOf(new Date()); // approximate for buckets without hourly splits
+}
+/// Weekday (1=Mon..7=Sun) of a local "YYYY-MM-DD" day key.
+function weekdayFromDayKey(dk) {
+  const [y, m, d] = String(dk).split("-").map(Number);
+  return weekdayOf(new Date(y, m - 1, d));
+}
 function initHourly() {
   return Array.from({ length: 24 }, () => ({ input: 0, cacheRead: 0, cacheWrite: 0, output: 0, requests: 0 }));
 }
-/** Peak/valley multiplier for a local hour. Flat (1) when time-of-use is off. */
-function multiplierFor(hour, tou) {
+/// Whether a weekday (1=Mon..7=Sun) matches a `days` rule. Spec: "all" /
+/// "weekday" / "weekend" / an array like [1,2,3,4,5]; missing or unknown → all
+/// days (keeps old configs behaving exactly as before).
+function dayMatches(weekday, days) {
+  if (days == null || days === "") return true;
+  if (typeof days === "string") {
+    const s = days.trim().toLowerCase();
+    if (s === "all") return true;
+    if (s === "weekday" || s === "workday") return weekday >= 1 && weekday <= 5;
+    if (s === "weekend") return weekday >= 6; // 6=Sat, 7=Sun
+    return true; // unknown string: lenient, treat as all days
+  }
+  if (Array.isArray(days)) return days.some((d) => Number(d) === weekday);
+  return true;
+}
+/**
+ * Peak/valley multiplier for a local hour on a given weekday. Flat (1) when
+ * time-of-use is off, or when the day doesn't match the `days` rule; peak on
+ * matching days inside peakRanges; valley otherwise.
+ */
+function multiplierFor(weekday, hour, tou) {
   if (!tou || !tou.enabled) return 1;
+  if (!dayMatches(weekday, tou.days)) return 1; // days 不匹配 → 原价
   for (const range of tou.peakRanges || []) {
     if (!Array.isArray(range) || range.length < 2) continue; // tolerate malformed entries
     const [s, e] = range;
-    if (typeof s === "number" && typeof e === "number" && hour >= s && hour < e) return tou.peakMultiplier ?? 1;
+    if (typeof s === "number" && typeof e === "number" && hour >= s && hour < e) return Math.max(1, tou.peakMultiplier ?? 1); // peak multiplier is a surcharge: never below 1
   }
   return tou.valleyMultiplier ?? 1;
 }
@@ -325,13 +357,15 @@ function foldSession(file) {
 }
 
 function recomputeCosts(pricing) {
-  for (const dayObj of days.values()) {
-    for (const b of dayObj.values()) b.estimatedCostUsd = costUsd(b, pricing);
+  for (const [date, dayObj] of days) {
+    const weekday = weekdayFromDayKey(date);
+    for (const b of dayObj.values()) b.estimatedCostUsd = costUsd(b, pricing, weekday);
   }
 }
 
 function emit(pricing) {
   const today = dayKey(Date.now());
+  const weekday = weekdayFromDayKey(today);
   const dayObj = days.get(today);
   let usd = 0, requests = 0, input = 0, output = 0, cacheRead = 0, cacheWrite = 0;
   if (dayObj) {
@@ -370,7 +404,7 @@ function emit(pricing) {
         cw += hb.cacheWrite;
         out += hb.output;
         r += hb.requests || 0;
-        u += hourlyCostUsd(b, h, pricing);
+        u += hourlyCostUsd(b, h, pricing, weekday);
       }
     }
     return { hour: h, usd: +u.toFixed(4), requests: r, input: inp, cacheRead: cr, cacheWrite: cw, output: out };

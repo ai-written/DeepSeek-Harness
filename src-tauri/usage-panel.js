@@ -362,6 +362,7 @@
         // hover range: "09:00 - 10:00"; the last hour ends at 24:00
         title: String(i).padStart(2, '0') + ':00 - ' + String(i + 1).padStart(2, '0') + ':00',
         usd: h.usd,
+        requests: h.requests,
         input: h.input,
         cacheRead: h.cacheRead,
         cacheWrite: h.cacheWrite,
@@ -376,6 +377,7 @@
         .map((d) => ({
           date: (d.date || '').slice(5),
           usd: d.usd,
+          requests: d.requests,
           input: d.input,
           cacheRead: d.cacheRead,
           cacheWrite: d.cacheWrite,
@@ -390,11 +392,13 @@
     const labels = points.map((p) => p.date)
     const amount = points.map((p) => +((p.usd || 0) * rate).toFixed(2))
     const tokens = points.map((p) => totalTokens(p))
+    const reqs = points.map((p) => Number(p.requests) || 0)
     const hit = points.map((p) => +hitRateOf(p).toFixed(1))
 
     // ── range totals: day / week / month summary above the chart ──
     const totalUsd = points.reduce((s, p) => s + (Number(p.usd) || 0), 0)
     const totalTok = points.reduce((s, p) => s + totalTokens(p), 0)
+    const totalReq = points.reduce((s, p) => s + (Number(p.requests) || 0), 0)
     const totIn = points.reduce((s, p) => s + (Number(p.input) || 0), 0)
     const totCr = points.reduce((s, p) => s + (Number(p.cacheRead) || 0), 0)
     const totalHit = totIn + totCr > 0 ? (totCr / (totIn + totCr)) * 100 : 0
@@ -419,10 +423,11 @@
     }
     statsRow.appendChild(mkStat('总金额（¥）', fmtMoney(totalUsd, rate)))
     statsRow.appendChild(mkStat('总 token', fmtTokens(totalTok)))
+    statsRow.appendChild(mkStat('总请求数', fmtTokens(totalReq)))
     statsRow.appendChild(mkStat('缓存命中率', totalHit.toFixed(1) + '%'))
     modalContent.appendChild(statsRow)
 
-    modalContent.appendChild(chartTitle(rangeLabel + ' 用量概览（金额 / token / 缓存命中率）'))
+    modalContent.appendChild(chartTitle(rangeLabel + ' 用量概览（金额 / token / 请求数 / 缓存命中率）'))
     const wrap = document.createElement('div')
     wrap.style.cssText = 'position:relative;width:100%;height:300px;'
     const canvas = document.createElement('canvas')
@@ -470,6 +475,18 @@
             pointBorderWidth: 2,
           },
           {
+            label: '请求数',
+            data: reqs,
+            yAxisID: 'y3',
+            borderColor: '#8250df',
+            tension: 0.35,
+            borderWidth: 2,
+            pointRadius: 2,
+            pointBackgroundColor: '#ffffff',
+            pointBorderColor: '#8250df',
+            pointBorderWidth: 2,
+          },
+          {
             label: '缓存命中率（%）',
             data: hit,
             yAxisID: 'y2',
@@ -499,6 +516,7 @@
               label: (c) => {
                 if (c.datasetIndex === 0) return '金额：¥' + c.parsed.y
                 if (c.datasetIndex === 1) return 'token：' + fmtTokens(c.parsed.y)
+                if (c.datasetIndex === 2) return '请求数：' + c.parsed.y
                 return '命中率：' + c.parsed.y + '%'
               },
             },
@@ -526,6 +544,13 @@
             position: 'right',
             min: 0,
             max: 100,
+            grid: { drawOnChartArea: false },
+            ticks: { display: false },
+            title: { display: false },
+          },
+          y3: {
+            type: 'linear',
+            position: 'right',
             grid: { drawOnChartArea: false },
             ticks: { display: false },
             title: { display: false },
@@ -578,6 +603,7 @@
 
     // ── editable rows (default row + one row per model override) ──
     const defTou = blank.timeOfUse || {}
+    const defDays = normDays(defTou.days)
     const rows = [
       {
         isDefault: true,
@@ -589,6 +615,8 @@
         mult: blank.multiplier ?? 1,
         peakRanges: Array.isArray(defTou.peakRanges) ? defTou.peakRanges.map((r) => r.join('-')).join(', ') : '',
         peakMultiplier: defTou.peakMultiplier,
+        days: defDays,
+        customDays: Array.isArray(defDays) ? defDays.slice() : null,
       },
     ]
     for (const [key, v] of Object.entries(blank.overrides || {})) {
@@ -596,6 +624,7 @@
       // merge rows for the same model (later override wins).
       const model = key.includes('|') ? key.slice(key.lastIndexOf('|') + 1) : key
       const tou = v.timeOfUse || {}
+      const nd = normDays(tou.days)
       const row = {
         isDefault: false,
         model,
@@ -606,6 +635,8 @@
         mult: v.multiplier,
         peakRanges: Array.isArray(tou.peakRanges) ? tou.peakRanges.map((r) => r.join('-')).join(', ') : '',
         peakMultiplier: tou.peakMultiplier,
+        days: nd,
+        customDays: Array.isArray(nd) ? nd.slice() : null,
       }
       const idx = rows.findIndex((r) => !r.isDefault && r.model === model)
       if (idx >= 0) rows[idx] = row
@@ -613,14 +644,14 @@
     }
 
     // ── table ──
-    body.appendChild(label('单价维护（US$ / 百万 token；模型名不区分供应商，如 deepseek-v4-flash；峰谷时间留空=不启用）', '#e6edf3'))
+    body.appendChild(label('单价维护（US$ / 百万 token；模型名不区分供应商，如 deepseek-v4-flash；峰时时间留空=不启用；峰时日期默认每天，可选工作日/周末/自定义）', '#e6edf3'))
     const wrap = document.createElement('div')
     wrap.style.cssText = 'overflow-x:auto;'
     const table = document.createElement('table')
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;'
     const thead = document.createElement('thead')
     const trh = document.createElement('tr')
-    for (const h of ['模型', '输入', '输出', '缓存读取', '缓存写入', '模型倍率', '峰谷时间', '峰时倍率', '']) {
+    for (const h of ['模型', '输入', '输出', '缓存读取', '缓存写入', '模型倍率', '峰时时间', '峰时日期', '峰时倍率', '']) {
       const th = document.createElement('th')
       th.textContent = h
       th.style.cssText = 'padding:4px 6px;text-align:left;color:#57606a;font-weight:600;border-bottom:1px solid #d0d7de;white-space:nowrap;'
@@ -689,6 +720,68 @@
           r.peakRanges = rangesInp.value
         }
         tdR.appendChild(rangesInp)
+        // peak-hour dates column: 每天 / 工作日 / 周末 / 自定义 (select + chips)
+        const tdDays = document.createElement('td')
+        const daysSel = document.createElement('select')
+        const DAY_OPTS = [
+          ['all', '每天'],
+          ['weekday', '工作日'],
+          ['weekend', '周末'],
+          ['custom', '自定义'],
+        ]
+        const selVal = Array.isArray(r.days) ? 'custom' : String(r.days || 'all')
+        for (const [v, lab] of DAY_OPTS) {
+          const o = document.createElement('option')
+          o.value = v
+          o.textContent = lab
+          if (v === selVal) o.selected = true
+          daysSel.appendChild(o)
+        }
+        daysSel.style.cssText = INPUT_STYLE + 'padding:3px 6px;font-size:12px;width:104px;cursor:pointer;'
+        focusableInput(daysSel)
+        const WEEKDAY_NAMES = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+        let chipsRow = null
+        function rebuildChips() {
+          if (chipsRow) chipsRow.remove()
+          chipsRow = null
+          if (daysSel.value !== 'custom') return
+          if (!Array.isArray(r.days) || !r.days.length) r.days = [1, 2, 3, 4, 5]
+          chipsRow = document.createElement('div')
+          chipsRow.style.cssText = 'display:flex;gap:2px;margin-top:3px;'
+          for (let wd = 1; wd <= 7; wd++) {
+            const on = r.days.indexOf(wd) >= 0
+            const chip = document.createElement('button')
+            chip.type = 'button'
+            chip.textContent = WEEKDAY_NAMES[wd - 1]
+            chip.title = '选择' + WEEKDAY_NAMES[wd - 1]
+            chip.style.cssText =
+              'flex:1;padding:2px 0;border-radius:5px;border:1px solid ' + (on ? '#2563eb' : '#d0d7de') + ';' +
+              'font-size:10px;cursor:pointer;font-family:inherit;' +
+              (on ? 'background:#2563eb;color:#fff;' : 'background:#f6f8fa;color:#57606a;')
+            chip.onclick = () => {
+              const i = r.days.indexOf(wd)
+              if (i >= 0) r.days.splice(i, 1)
+              else {
+                r.days.push(wd)
+                r.days.sort((a, b) => a - b)
+              }
+              rebuildChips()
+            }
+            chipsRow.appendChild(chip)
+          }
+          tdDays.appendChild(chipsRow)
+        }
+        daysSel.onchange = () => {
+          if (daysSel.value === 'custom') {
+            if (!Array.isArray(r.days)) r.days = Array.isArray(r.customDays) && r.customDays.length ? r.customDays.slice() : [1, 2, 3, 4, 5]
+          } else {
+            if (Array.isArray(r.days)) r.customDays = r.days.slice()
+            r.days = daysSel.value
+          }
+          rebuildChips()
+        }
+        tdDays.appendChild(daysSel)
+        rebuildChips()
         const tdP = document.createElement('td')
         const peakInp = cellInput(r.peakMultiplier, '56px')
         peakInp.oninput = () => {
@@ -715,6 +808,7 @@
         tr.appendChild(mk('cacheWrite'))
         tr.appendChild(tdMult)
         tr.appendChild(tdR)
+        tr.appendChild(tdDays)
         tr.appendChild(tdP)
         tr.appendChild(tdD)
         tbody.appendChild(tr)
@@ -726,7 +820,7 @@
     const addBtn = makeButton('＋ 添加模型', 'secondary')
     addBtn.style.cssText += 'margin-top:8px;padding:5px 14px;font-size:12px;'
     addBtn.onclick = () => {
-      rows.push({ isDefault: false, model: '', input: '', output: '', cacheRead: '', cacheWrite: '', mult: '', peakRanges: '', peakMultiplier: '' })
+      rows.push({ isDefault: false, model: '', input: '', output: '', cacheRead: '', cacheWrite: '', mult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
       rerender()
     }
     body.appendChild(addBtn)
@@ -742,6 +836,36 @@
         }
       }
       return out
+    }
+
+    // Normalize a loaded `days` value for the form/display: number arrays as-is
+    // (elements coerced to ints 1..7), weekday/workday variants → 'weekday',
+    // 'weekend' → 'weekend', anything else (missing/unknown/empty) → 'all'.
+    function normDays(days) {
+      if (Array.isArray(days)) {
+        const nums = days.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 7)
+        return nums.length ? nums : 'all'
+      }
+      if (typeof days === 'string') {
+        const s = days.trim().toLowerCase()
+        if (s === 'weekday' || s === 'workday') return 'weekday'
+        if (s === 'weekend') return 'weekend'
+      }
+      return 'all'
+    }
+
+    // 峰时倍率: 留空/非法 → 1（原价）；显式填 0 或低于 1（如 0.5、负数）同样按 1 计——
+    // 峰时是加价通道，倍率语义上不小于 1。
+    function peakMult(v) {
+      const n = parseFloat(v)
+      return Number.isFinite(n) ? Math.max(1, n) : 1
+    }
+
+    // Days rule for save: "all" (default) | "weekday" | "weekend" | [1..7] (1=周一).
+    function saveDays(days) {
+      if (Array.isArray(days) && days.length) return days
+      if (days === 'weekday' || days === 'weekend') return days
+      return 'all'
     }
 
     return {
@@ -770,7 +894,10 @@
           }
           const ranges = parseRanges(r.peakRanges)
           if (ranges.length) {
-            entry.timeOfUse = { enabled: true, peakMultiplier: num(r.peakMultiplier), valleyMultiplier: 1, peakRanges: ranges }
+            const tou = { enabled: true, peakMultiplier: peakMult(r.peakMultiplier), valleyMultiplier: 1, peakRanges: ranges }
+            const days = saveDays(r.days)
+            if (days !== 'all') tou.days = days
+            entry.timeOfUse = tou
           }
           overrides[model] = entry
         }
@@ -783,7 +910,10 @@
         }
         const defRanges = parseRanges(defRow.peakRanges)
         if (defRanges.length) {
-          obj.timeOfUse = { enabled: true, peakMultiplier: num(defRow.peakMultiplier), valleyMultiplier: 1, peakRanges: defRanges }
+          const tou = { enabled: true, peakMultiplier: peakMult(defRow.peakMultiplier), valleyMultiplier: 1, peakRanges: defRanges }
+          const days = saveDays(defRow.days)
+          if (days !== 'all') tou.days = days
+          obj.timeOfUse = tou
         }
         // Remember the just-saved config locally so reopening the dialog always
         // shows it, independent of the async read round-trip.
