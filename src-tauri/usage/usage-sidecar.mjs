@@ -14,7 +14,9 @@
 //             "hourly":[{hour,usd,requests,input,cacheRead,cacheWrite,output}×24],
 //             "providers":[{provider,usd,requests,...,hourly:[...]}]},
 //    "recent":[{date,usd,requests,"providers":[{provider,usd,requests,...}]}],
-//    "exchangeRate":7.2}
+//    "exchangeRate":7.2,"totalCurrency":"usd"}
+// Every `usd` field holds the amount in the configured total currency
+// (totalCurrency: "usd" | "cny"); `cny` is always the CNY badge value.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -52,28 +54,40 @@ function decodeMultiFrame(buf) {
 
 // ── pricing ─────────────────────────────────────────────────────────────────
 // The default template written on first run (no usage-pricing.json yet). This
-// is the current working configuration, so a fresh user starts with it.
+// mirrors the current working configuration, so a fresh user starts with it.
 const DEFAULT_TEMPLATE = {
   exchangeRate: 6.74,
-  default: { inputPerMillion: 0.22, cacheReadPerMillion: 0.007, cacheWritePerMillion: 0, outputPerMillion: 0.66 },
+  default: { inputPerMillion: 1.5, cacheReadPerMillion: 0.05, cacheWritePerMillion: 0, outputPerMillion: 4.5, currency: "cny" },
+  totalCurrency: "cny",
   multiplier: 1,
   pollMs: 3000,
   overrides: {
     "deepseek-v4-flash": {
-      inputPerMillion: 0.22,
-      cacheReadPerMillion: 0.007,
+      inputPerMillion: 1.5,
+      cacheReadPerMillion: 0.05,
       cacheWritePerMillion: 0,
-      outputPerMillion: 0.66,
+      outputPerMillion: 4.5,
+      currency: "cny",
       multiplier: 1,
-      timeOfUse: { enabled: true, peakMultiplier: 2, valleyMultiplier: 1, peakRanges: [[9, 12], [14, 18]] },
+      timeOfUse: { enabled: true, peakMultiplier: 2, valleyMultiplier: 1, peakRanges: [[9, 12], [14, 18]], days: "weekday" },
+    },
+    "deepseek-v4-flash-vision-exp": {
+      inputPerMillion: 1.5,
+      cacheReadPerMillion: 0.05,
+      cacheWritePerMillion: 0,
+      outputPerMillion: 4.5,
+      currency: "cny",
+      multiplier: 1,
+      timeOfUse: { enabled: true, peakMultiplier: 2, valleyMultiplier: 1, peakRanges: [[9, 12], [14, 18]], days: "weekday" },
     },
     "deepseek-v4-pro": {
-      inputPerMillion: 0.66,
-      cacheReadPerMillion: 0.022,
+      inputPerMillion: 4.5,
+      cacheReadPerMillion: 0.15,
       cacheWritePerMillion: 0,
-      outputPerMillion: 1.98,
-      multiplier: 2,
-      timeOfUse: { enabled: true, peakMultiplier: 2, valleyMultiplier: 1, peakRanges: [[9, 12], [14, 18]] },
+      outputPerMillion: 13.5,
+      currency: "cny",
+      multiplier: 1,
+      timeOfUse: { enabled: true, peakMultiplier: 2, valleyMultiplier: 1, peakRanges: [[9, 12], [14, 18]], days: "weekday" },
     },
   },
 };
@@ -101,6 +115,7 @@ function loadPricing() {
       timeOfUse: u.timeOfUse,
       pollMs: u.pollMs,
       multiplier: u.multiplier ?? DEFAULT_TEMPLATE.multiplier,
+      totalCurrency: u.totalCurrency ?? DEFAULT_TEMPLATE.totalCurrency,
     };
   } catch {
     return DEFAULT_TEMPLATE;
@@ -156,23 +171,50 @@ function modelMultiplier(pricing, provider, model) {
   return pricing.multiplier ?? 1;
 }
 
+// Per-model price currency: an override row's own currency wins (model-name
+// row first), otherwise the default row's currency, defaulting to CNY.
+function resolveCurrency(pricing, provider, model) {
+  for (const k of matchKeys(provider, model)) {
+    const row = pricing.overrides?.[k];
+    if (row && row.currency) return row.currency;
+  }
+  return pricing.default?.currency || "cny";
+}
+
+// The currency every internal total is expressed in: `totalCurrency` config
+// ("cny" default | "usd"). When rows are priced in the same currency no
+// exchange rate is involved; only cross-currency rows use the live rate.
+function totalCurrencyOf(pricing) {
+  return pricing.totalCurrency === "usd" ? "usd" : "cny";
+}
+
+// Convert a cost quoted in `from` currency to the configured total currency.
+// Same-currency conversion is a no-op (no exchange rate needed); otherwise
+// CNY→USD divides and USD→CNY multiplies by the live rate.
+function convertCost(cost, from, pricing) {
+  const total = totalCurrencyOf(pricing);
+  if (from === total) return cost;
+  return from === "cny" ? cost / (pricing.exchangeRate || 1) : cost * (pricing.exchangeRate || 1);
+}
+
 /// Cost of one hour's tokens for a bucket: that hour's time-of-use multiplier
 /// and the model multiplier applied. Shared by costUsd (bucket total) and the
-/// per-hour series emitted to the panel's day view.
+/// per-hour series emitted to the panel's day view. The result is expressed in
+/// the configured total currency (see totalCurrencyOf).
 function hourlyCostUsd(bucket, hour, pricing, weekday = flatWeekday()) {
   const p = resolvePrice(pricing, bucket.provider, bucket.model);
   const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
   const m = bucket.hourly?.[hour];
   if (!m) return 0;
   const mult = multiplierFor(weekday, hour, modelTimeOfUse(pricing, bucket.provider, bucket.model));
-  return (
+  const cost =
     ((m.input / 1e6) * p.inputPerMillion +
       (m.cacheRead / 1e6) * p.cacheReadPerMillion +
       (m.cacheWrite / 1e6) * p.cacheWritePerMillion +
       (m.output / 1e6) * p.outputPerMillion) *
     mult *
-    mm
-  );
+    mm;
+  return convertCost(cost, resolveCurrency(pricing, bucket.provider, bucket.model), pricing);
 }
 
 function costUsd(bucket, pricing, weekday = flatWeekday()) {
@@ -188,14 +230,14 @@ function costUsd(bucket, pricing, weekday = flatWeekday()) {
   const tou = modelTimeOfUse(pricing, bucket.provider, bucket.model);
   const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
   const mult = multiplierFor(flatWeekday(), flatHour(), tou);
-  return (
+  const cost =
     ((bucket.input / 1e6) * p.inputPerMillion +
       (bucket.cacheRead / 1e6) * p.cacheReadPerMillion +
       (bucket.cacheWrite / 1e6) * p.cacheWritePerMillion +
       (bucket.output / 1e6) * p.outputPerMillion) *
     mult *
-    mm
-  );
+    mm;
+  return convertCost(cost, resolveCurrency(pricing, bucket.provider, bucket.model), pricing);
 }
 
 // ── time-of-use (peak / valley) pricing ──────────────────────────────────────
@@ -497,11 +539,14 @@ function emit(pricing) {
     return { hour: h, usd: +u.toFixed(4), requests: r, input: inp, cacheRead: cr, cacheWrite: cw, output: out };
   });
   const providers = summarizeProviders(dayObj, pricing, weekday, true);
+  // The badge is always shown in CNY: totals already in CNY need no rate; USD
+  // totals are converted with the live exchange rate.
+  const cny = totalCurrencyOf(pricing) === "cny" ? usd : usd * (pricing.exchangeRate || 1);
   console.log(
     JSON.stringify({
       today: {
         date: today,
-        cny: +(usd * pricing.exchangeRate).toFixed(2),
+        cny: +cny.toFixed(2),
         usd: +usd.toFixed(4),
         requests,
         input,
@@ -513,6 +558,7 @@ function emit(pricing) {
       },
       recent,
       exchangeRate: pricing.exchangeRate,
+      totalCurrency: totalCurrencyOf(pricing),
     }),
   );
 }

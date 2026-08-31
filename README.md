@@ -85,6 +85,8 @@ npm run build
 
 - **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 zstd），按 `provider` / 模型分桶并每 3 秒增量刷新；打开用量弹窗时暂停轮询，以弹窗打开瞬间的数据为准，关闭后立即恢复；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染
 - **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率与峰时时段计价；sidecar 每次刷新重读，改动即时生效
+- **计价单位**：`default.currency` 与各 override 行的 `currency` 可选 `"cny"`（人民币，缺省）或 `"usd"`（美元）；旧配置缺省该字段时按人民币计
+- **合计币种**：顶层 `totalCurrency` 可选 `"cny"`（缺省）或 `"usd"`，决定所有金额合计的币种；各行价格按计价单位换算到合计币种，**计价单位与合计币种一致时不经汇率**（全部按人民币计价时无需汇率换算）；徽标与图表始终以人民币显示
 - **单价匹配优先级**：`overrides` 的键支持 `模型名`、`provider|模型名`、`provider|*`、`*|模型名` 四种写法；逐价格字段按「纯模型名 > `provider|模型名` > `provider|*` > `*|模型名`」取最高优先级匹配，高优先级行未定义的字段由低优先级行补全（同一键只保留一行，界面保存时会拒绝重复键）
 
 峰时档位（`timeOfUse`）可选字段 `days` 限定峰时适用日期，缺省 `all`（每天，行为与旧版一致）：

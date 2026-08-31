@@ -369,7 +369,9 @@
     modalContent.innerHTML = ''
     const payload = modalPayload || lastPayload || {}
     const recent = Array.isArray(payload.recent) ? payload.recent : []
-    const rate = payload.exchangeRate || 7.2
+    // The sidecar's amount fields are in the configured total currency; only
+    // USD totals need the exchange rate to be displayed in ¥.
+    const rate = payload.totalCurrency === 'cny' ? 1 : payload.exchangeRate || 7.2
 
     // Provider filter. The sidecar supplies provider summaries alongside the
     // existing all-provider totals, so changing this menu only re-renders the
@@ -629,7 +631,7 @@
   function renderForm(body, status) {
     body.innerHTML = ''
 
-    // ── exchange rate + refresh interval (one row) ──
+    // ── exchange rate + total currency + refresh interval (one row) ──
     const topRow = document.createElement('div')
     topRow.style.cssText = 'display:flex;gap:12px;align-items:flex-end;'
     const rateCol = document.createElement('div')
@@ -637,6 +639,22 @@
     rateCol.appendChild(label('汇率 USD→CNY'))
     const rateEl = numberInput(blank.exchangeRate)
     rateCol.appendChild(rateEl)
+    const curCol = document.createElement('div')
+    curCol.style.cssText = 'flex:1;'
+    curCol.appendChild(label('合计币种'))
+    const curSel = document.createElement('select')
+    const curTotal = blank.totalCurrency === 'usd' ? 'usd' : 'cny'
+    for (const [v, lab] of [['usd', '美元'], ['cny', '人民币']]) {
+      const opt = document.createElement('option')
+      opt.value = v
+      opt.textContent = lab
+      if (v === curTotal) opt.selected = true
+      curSel.appendChild(opt)
+    }
+    curSel.title = '所有金额合计所用的币种：价格按各行计价单位换算到该币种；全部用人民币时无需汇率'
+    curSel.style.cssText = INPUT_STYLE + 'width:100%;cursor:pointer;'
+    focusableInput(curSel)
+    curCol.appendChild(curSel)
     const pollCol = document.createElement('div')
     pollCol.style.cssText = 'flex:1;'
     pollCol.appendChild(label('刷新间隔'))
@@ -664,6 +682,7 @@
     focusableInput(pollSel)
     pollCol.appendChild(pollSel)
     topRow.appendChild(rateCol)
+    topRow.appendChild(curCol)
     topRow.appendChild(pollCol)
     body.appendChild(topRow)
 
@@ -678,6 +697,7 @@
         output: blank.default?.outputPerMillion,
         cacheRead: blank.default?.cacheReadPerMillion,
         cacheWrite: blank.default?.cacheWritePerMillion,
+        currency: blank.default?.currency || 'cny',
         mult: blank.multiplier ?? 1,
         peakRanges: Array.isArray(defTou.peakRanges) ? defTou.peakRanges.map((r) => r.join('-')).join(', ') : '',
         peakMultiplier: defTou.peakMultiplier,
@@ -700,6 +720,7 @@
         output: v.outputPerMillion,
         cacheRead: v.cacheReadPerMillion,
         cacheWrite: v.cacheWritePerMillion,
+        currency: v.currency || 'cny',
         mult: v.multiplier,
         peakRanges: Array.isArray(tou.peakRanges) ? tou.peakRanges.map((r) => r.join('-')).join(', ') : '',
         peakMultiplier: tou.peakMultiplier,
@@ -710,14 +731,14 @@
     }
 
     // ── table ──
-    body.appendChild(label('单价维护（US$ / 百万 token；模型名不区分供应商，如 deepseek-v4-flash；峰时时间留空=不启用；峰时日期默认每天，可选工作日/周末/自定义）', '#e6edf3'))
+    body.appendChild(label('单价维护（$ / 百万 token，计价单位可逐模型选美元或人民币，人民币按当前汇率换算；峰时时间留空=不启用；峰时日期默认每天，可选工作日/周末/自定义）', '#e6edf3'))
     const wrap = document.createElement('div')
     wrap.style.cssText = 'overflow-x:auto;'
     const table = document.createElement('table')
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;'
     const thead = document.createElement('thead')
     const trh = document.createElement('tr')
-    for (const h of ['模型', '输入', '输出', '缓存读取', '缓存写入', '模型倍率', '峰时时间', '峰时日期', '峰时倍率', '']) {
+    for (const h of ['模型', '计价单位', '输入', '输出', '缓存读取', '缓存写入', '模型倍率', '峰时时间', '峰时日期', '峰时倍率', '']) {
       const th = document.createElement('th')
       th.textContent = h
       th.style.cssText = 'padding:4px 6px;text-align:left;color:#57606a;font-weight:600;border-bottom:1px solid #d0d7de;white-space:nowrap;'
@@ -763,6 +784,27 @@
           }
           tdM.appendChild(inp)
         }
+        // currency column: per-row price unit (usd | cny)
+        const tdCur = document.createElement('td')
+        const curSel = document.createElement('select')
+        const CURRENCY_OPTS = [
+          ['usd', '美元'],
+          ['cny', '人民币'],
+        ]
+        const curVal = r.currency === 'cny' ? 'cny' : 'usd'
+        for (const [v, lab] of CURRENCY_OPTS) {
+          const o = document.createElement('option')
+          o.value = v
+          o.textContent = lab
+          if (v === curVal) o.selected = true
+          curSel.appendChild(o)
+        }
+        curSel.style.cssText = INPUT_STYLE + 'padding:3px 6px;font-size:12px;width:76px;cursor:pointer;'
+        focusableInput(curSel)
+        curSel.onchange = () => {
+          r.currency = curSel.value
+        }
+        tdCur.appendChild(curSel)
         // price columns
         const mk = (key) => {
           const td = document.createElement('td')
@@ -869,6 +911,7 @@
           tdD.appendChild(del)
         }
         tr.appendChild(tdM)
+        tr.appendChild(tdCur)
         tr.appendChild(mk('input'))
         tr.appendChild(mk('output'))
         tr.appendChild(mk('cacheRead'))
@@ -887,7 +930,7 @@
     const addBtn = makeButton('＋ 添加模型', 'secondary')
     addBtn.style.cssText += 'margin-top:8px;padding:5px 14px;font-size:12px;'
     addBtn.onclick = () => {
-      rows.push({ isDefault: false, key: '', model: '', input: '', output: '', cacheRead: '', cacheWrite: '', mult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
+      rows.push({ isDefault: false, key: '', model: '', input: '', output: '', cacheRead: '', cacheWrite: '', currency: 'cny', mult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
       rerender()
     }
     body.appendChild(addBtn)
@@ -962,6 +1005,7 @@
           cacheReadPerMillion: num(defRow.cacheRead),
           cacheWritePerMillion: num(defRow.cacheWrite),
           outputPerMillion: num(defRow.output),
+          currency: defRow.currency === 'cny' ? 'cny' : 'usd',
         }
         const overrides = {}
         for (const r of rows.slice(1)) {
@@ -972,6 +1016,7 @@
             cacheReadPerMillion: num(r.cacheRead),
             cacheWritePerMillion: num(r.cacheWrite),
             outputPerMillion: num(r.output),
+            currency: r.currency === 'cny' ? 'cny' : 'usd',
             multiplier: num(r.mult) || 1,
           }
           const ranges = parseRanges(r.peakRanges)
@@ -989,6 +1034,7 @@
           overrides,
           pollMs: Number(pollSel.value),
           multiplier: num(defRow.mult) || 1,
+          totalCurrency: curSel.value === 'cny' ? 'cny' : 'usd',
         }
         const defRanges = parseRanges(defRow.peakRanges)
         if (defRanges.length) {
@@ -1016,11 +1062,12 @@
   // to usage-pricing.json on first run; this form always reads from the file.
   const defaultPricing = {
     exchangeRate: undefined,
-    default: { inputPerMillion: undefined, cacheReadPerMillion: undefined, cacheWritePerMillion: undefined, outputPerMillion: undefined },
+    default: { inputPerMillion: undefined, cacheReadPerMillion: undefined, cacheWritePerMillion: undefined, outputPerMillion: undefined, currency: 'cny' },
     overrides: {},
     timeOfUse: undefined,
     pollMs: undefined,
     multiplier: 1,
+    totalCurrency: 'cny',
   }
   let blank = { ...defaultPricing, default: { ...defaultPricing.default } }
   let saveFn = null
@@ -1070,11 +1117,13 @@
           cacheReadPerMillion: p.default?.cacheReadPerMillion,
           cacheWritePerMillion: p.default?.cacheWritePerMillion,
           outputPerMillion: p.default?.outputPerMillion,
+          currency: p.default?.currency,
         },
         overrides: p.overrides || {},
         timeOfUse: p.timeOfUse,
         pollMs: p.pollMs,
         multiplier: p.multiplier ?? 1,
+        totalCurrency: p.totalCurrency,
       }
     } catch {
       return { ...defaultPricing, default: { ...defaultPricing.default } }
