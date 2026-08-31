@@ -123,6 +123,7 @@ struct HarnessState {
 struct UsageState {
     child: Mutex<Option<Child>>,
     pid: Mutex<Option<u32>>,
+    paused: Mutex<bool>,
 }
 
 /// Startup progress forwarded to the placeholder page (`dsh-startup` event).
@@ -620,7 +621,7 @@ fn spawn_usage_sidecar(app: &tauri::AppHandle) -> std::io::Result<Child> {
     let mut cmd = Command::new(node);
     cmd.arg(&script)
         .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -656,7 +657,7 @@ fn spawn_usage_sidecar(app: &tauri::AppHandle) -> std::io::Result<Child> {
     let script = usage_sidecar_path(app);
     let mut cmd = Command::new("node");
     cmd.arg(&script)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -685,6 +686,31 @@ fn spawn_usage_sidecar(app: &tauri::AppHandle) -> std::io::Result<Child> {
         });
     }
     Ok(child)
+}
+
+/// Pause or resume the sidecar's polling loop. The sidecar keeps stdin open
+/// as a tiny control channel so opening the usage dialog can hold a stable
+/// snapshot without killing and recreating the child process.
+fn set_usage_polling(state: &Arc<UsageState>, paused: bool) {
+    let command = if paused { "pause\n" } else { "resume\n" };
+    if let Ok(mut value) = state.paused.lock() {
+        *value = paused;
+    }
+    let mut guard = match state.child.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let Some(child) = guard.as_mut() else {
+        log_line("usage polling control: sidecar child is not ready");
+        return;
+    };
+    let Some(stdin) = child.stdin.as_mut() else {
+        log_line("usage polling control: sidecar stdin is unavailable");
+        return;
+    };
+    if let Err(e) = stdin.write_all(command.as_bytes()).and_then(|_| stdin.flush()) {
+        log_line(&format!("usage polling control failed ({command:?}): {e}"));
+    }
 }
 
 /// A file under the dsh home's `storages` directory, shared with the CLI.
@@ -1325,6 +1351,7 @@ fn main() {
             let usage_state = Arc::new(UsageState {
                 child: Mutex::new(None),
                 pid: Mutex::new(None),
+                paused: Mutex::new(false),
             });
             app.manage(usage_state.clone());
             if usage_badge_enabled {
@@ -1338,6 +1365,14 @@ fn main() {
                             *usage_state_thread.pid.lock().unwrap() = Some(pid);
                             *usage_state_thread.child.lock().unwrap() = Some(child);
                             log_line(&format!("usage sidecar: pid stored={pid}"));
+                            // Read the flag into a plain bool so this lock is
+                            // released before set_usage_polling takes it again
+                            // (Mutex is not reentrant) and so we never hold
+                            // `child` and `paused` at the same time.
+                            let was_paused = *usage_state_thread.paused.lock().unwrap();
+                            if was_paused {
+                                set_usage_polling(&usage_state_thread, true);
+                            }
                         }
                         Err(e) => log_line(&format!("usage sidecar start failed: {e}")),
                     }
@@ -1354,6 +1389,14 @@ fn main() {
                     let payload = e.payload();
                     let ack = pricing_write(payload);
                     let _ = pricing_app2.emit("usage-pricing-saved", ack);
+                });
+                let usage_state_pause = usage_state.clone();
+                app.handle().listen("usage-poll-pause", move |_e| {
+                    set_usage_polling(&usage_state_pause, true);
+                });
+                let usage_state_resume = usage_state.clone();
+                app.handle().listen("usage-poll-resume", move |_e| {
+                    set_usage_polling(&usage_state_resume, false);
                 });
             }
 
@@ -1468,6 +1511,8 @@ fn main() {
             }
             let update_cache_load = update_cache.clone();
             let update_app_load = app.handle().clone();
+            let usage_state_load = usage_state.clone();
+            let usage_badge_load = usage_badge_enabled;
             let window_builder = window_builder
                     // Log every page load (placeholder page AND the harness URL) so
                     // the log confirms the WebView actually reached the dsh UI —
@@ -1480,6 +1525,15 @@ fn main() {
                             }
                             tauri::webview::PageLoadEvent::Finished => {
                                 log_line(&format!("page load finished: {url}"));
+                                // Safety net for the usage-panel pause: if the
+                                // previous page was discarded while the usage
+                                // dialog was open, the panel's beforeunload
+                                // resume event may have been lost. A fresh page
+                                // means no modal is open anymore, so unpause the
+                                // sidecar to keep the badge updating.
+                                if usage_badge_load && *usage_state_load.paused.lock().unwrap() {
+                                    set_usage_polling(&usage_state_load, false);
+                                }
                                 // Re-emit a cached update result so the banner
                                 // listener on THIS page always gets it, even when
                                 // the check completed before this page loaded.

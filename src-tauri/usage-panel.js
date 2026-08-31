@@ -4,8 +4,9 @@
 // initialization_script). It paints a single-line pill at the bottom-left (right
 // of the sidebar's settings button) showing today's estimated cost in CNY only;
 // hovering shows requests / date / recent days. Clicking the pill opens a small
-// dialog to edit the exchange rate, the default per-million prices, and per-model
-// overrides. Saving writes `~/.dsh/storages/usage-pricing.json` via the
+// dialog to view charts, filter by provider, and edit the exchange rate, the
+// default per-million prices, and per-model overrides. Saving writes
+// `~/.dsh/storages/usage-pricing.json` via the
 // `save_usage_pricing` Tauri command; the sidecar re-reads it on every emit, so
 // the displayed amount updates within a few seconds. The panel only appears once
 // the first amount has rendered (no empty box).
@@ -110,6 +111,7 @@
   let modalSaveBtn = null
   let tabChartEl = null
   let tabFormEl = null
+  let modalPayload = null
   const FIELDS = [
     ['inputPerMillion', '输入（每百万$）'],
     ['cacheReadPerMillion', '缓存读（每百万$）'],
@@ -325,12 +327,84 @@
 
   let chartRange = 'day' // 'day' | 'week' | 'month'
   let chartInstance = null
+  let providerFilter = '' // empty = all providers
+
+  function providerEntries(summary) {
+    return Array.isArray(summary?.providers) ? summary.providers : []
+  }
+
+  function providerNames(payload) {
+    const names = new Set()
+    for (const row of providerEntries(payload?.today)) {
+      if (row.provider != null) names.add(String(row.provider))
+    }
+    for (const day of Array.isArray(payload?.recent) ? payload.recent : []) {
+      for (const row of providerEntries(day)) {
+        if (row.provider != null) names.add(String(row.provider))
+      }
+    }
+    return [...names].sort((a, b) => a.localeCompare(b))
+  }
+
+  function providerSummary(summary) {
+    if (!providerFilter) return summary || null
+    return providerEntries(summary).find((row) => String(row.provider) === providerFilter) || null
+  }
+
+  function usagePoint(source, date, title) {
+    const row = source || {}
+    return {
+      date,
+      title,
+      usd: row.usd,
+      requests: row.requests,
+      input: row.input,
+      cacheRead: row.cacheRead,
+      cacheWrite: row.cacheWrite,
+      output: row.output,
+    }
+  }
 
   function renderChartTab() {
     modalContent.innerHTML = ''
-    const payload = lastPayload || {}
+    const payload = modalPayload || lastPayload || {}
     const recent = Array.isArray(payload.recent) ? payload.recent : []
     const rate = payload.exchangeRate || 7.2
+
+    // Provider filter. The sidecar supplies provider summaries alongside the
+    // existing all-provider totals, so changing this menu only re-renders the
+    // current chart and does not trigger another log scan.
+    const providers = providerNames(payload)
+    if (providerFilter && !providers.includes(providerFilter)) providerFilter = ''
+    const filterRow = document.createElement('div')
+    filterRow.style.cssText = 'display:flex;align-items:center;gap:10px;margin-bottom:10px;'
+    const filterLabel = document.createElement('label')
+    filterLabel.textContent = '供应商'
+    filterLabel.style.cssText = 'font-size:12px;font-weight:600;color:#57606a;white-space:nowrap;'
+    const filter = document.createElement('select')
+    filter.id = 'deepseek-harness-provider-filter'
+    filter.setAttribute('aria-label', '供应商筛选')
+    filter.style.cssText =
+      'min-width:180px;max-width:100%;padding:6px 30px 6px 10px;border-radius:8px;border:1px solid #d0d7de;' +
+      'background:#f6f8fa;color:#1f2328;font:inherit;font-size:12.5px;cursor:pointer;outline:none;'
+    const allOption = document.createElement('option')
+    allOption.value = ''
+    allOption.textContent = '全部供应商'
+    filter.appendChild(allOption)
+    for (const name of providers) {
+      const option = document.createElement('option')
+      option.value = name
+      option.textContent = name
+      filter.appendChild(option)
+    }
+    filter.value = providerFilter
+    filter.onchange = () => {
+      providerFilter = filter.value
+      renderChartTab()
+    }
+    filterRow.appendChild(filterLabel)
+    filterRow.appendChild(filter)
+    modalContent.appendChild(filterRow)
 
     // 天 / 周 / 月 range toggle.
     const bar = document.createElement('div')
@@ -356,36 +430,27 @@
     let points = []
     let rangeLabel = ''
     if (chartRange === 'day') {
-      const hourly = Array.isArray(payload.today?.hourly) ? payload.today.hourly : []
-      points = hourly.map((h, i) => ({
-        date: String(i).padStart(2, '0') + ':00',
-        // hover range: "09:00 - 10:00"; the last hour ends at 24:00
-        title: String(i).padStart(2, '0') + ':00 - ' + String(i + 1).padStart(2, '0') + ':00',
-        usd: h.usd,
-        requests: h.requests,
-        input: h.input,
-        cacheRead: h.cacheRead,
-        cacheWrite: h.cacheWrite,
-        output: h.output,
-      }))
+      const today = providerSummary(payload.today)
+      const hourly = Array.isArray(today?.hourly) ? today.hourly : []
+      points = hourly.map((h, i) =>
+        usagePoint(
+          h,
+          String(i).padStart(2, '0') + ':00',
+          // hover range: "09:00 - 10:00"; the last hour ends at 24:00
+          String(i).padStart(2, '0') + ':00 - ' + String(i + 1).padStart(2, '0') + ':00',
+        ),
+      )
       rangeLabel = '今日'
     } else {
       const limit = chartRange === 'month' ? 30 : 7
       points = recent
         .slice(0, limit)
         .reverse()
-        .map((d) => ({
-          date: (d.date || '').slice(5),
-          usd: d.usd,
-          requests: d.requests,
-          input: d.input,
-          cacheRead: d.cacheRead,
-          cacheWrite: d.cacheWrite,
-          output: d.output,
-        }))
+        .map((d) => usagePoint(providerSummary(d) || {}, (d.date || '').slice(5), (d.date || '').slice(5)))
       rangeLabel = chartRange === 'month' ? '近 30 日' : '近 7 日'
     }
-    if (!points.length) {
+    const hasData = points.some((p) => (Number(p.usd) || 0) !== 0 || totalTokens(p) !== 0 || (Number(p.requests) || 0) !== 0)
+    if (!points.length || (providerFilter && !hasData)) {
       modalContent.appendChild(emptyBox('暂无用量数据'))
       return
     }
@@ -403,7 +468,8 @@
     const totCr = points.reduce((s, p) => s + (Number(p.cacheRead) || 0), 0)
     const totalHit = totIn + totCr > 0 ? (totCr / (totIn + totCr)) * 100 : 0
 
-    modalContent.appendChild(chartTitle(rangeLabel + '合计'))
+    const scopeLabel = providerFilter ? '（' + providerFilter + '）' : ''
+    modalContent.appendChild(chartTitle(rangeLabel + scopeLabel + '合计'))
     const statsRow = document.createElement('div')
     statsRow.style.cssText = 'display:flex;gap:10px;margin:0 0 4px;'
     const mkStat = (label, value) => {
@@ -427,7 +493,7 @@
     statsRow.appendChild(mkStat('缓存命中率', totalHit.toFixed(1) + '%'))
     modalContent.appendChild(statsRow)
 
-    modalContent.appendChild(chartTitle(rangeLabel + ' 用量概览（金额 / token / 请求数 / 缓存命中率）'))
+    modalContent.appendChild(chartTitle(rangeLabel + scopeLabel + ' 用量概览（金额 / token / 请求数 / 缓存命中率）'))
     const wrap = document.createElement('div')
     wrap.style.cssText = 'position:relative;width:100%;height:300px;'
     const canvas = document.createElement('canvas')
@@ -620,13 +686,15 @@
       },
     ]
     for (const [key, v] of Object.entries(blank.overrides || {})) {
-      // Model names are provider-independent: strip any "provider|" prefix and
-      // merge rows for the same model (later override wins).
+      // Keep the complete override key so provider-qualified and wildcard rows
+      // survive a read-edit-save round trip without being merged by model name.
+      const overrideKey = key
       const model = key.includes('|') ? key.slice(key.lastIndexOf('|') + 1) : key
       const tou = v.timeOfUse || {}
       const nd = normDays(tou.days)
       const row = {
         isDefault: false,
+        key: overrideKey,
         model,
         input: v.inputPerMillion,
         output: v.outputPerMillion,
@@ -638,9 +706,7 @@
         days: nd,
         customDays: Array.isArray(nd) ? nd.slice() : null,
       }
-      const idx = rows.findIndex((r) => !r.isDefault && r.model === model)
-      if (idx >= 0) rows[idx] = row
-      else rows.push(row)
+      rows.push(row)
     }
 
     // ── table ──
@@ -689,9 +755,10 @@
           span.style.cssText = 'font-weight:700;color:#1f2328;padding:3px 6px;'
           tdM.appendChild(span)
         } else {
-          const inp = textInput(r.model, '150px')
-          inp.placeholder = '模型名，如 deepseek-v4-flash'
+          const inp = textInput(r.key ?? r.model, '150px')
+          inp.placeholder = '模型名或 provider|模型名'
           inp.oninput = () => {
+            r.key = inp.value
             r.model = inp.value
           }
           tdM.appendChild(inp)
@@ -820,7 +887,7 @@
     const addBtn = makeButton('＋ 添加模型', 'secondary')
     addBtn.style.cssText += 'margin-top:8px;padding:5px 14px;font-size:12px;'
     addBtn.onclick = () => {
-      rows.push({ isDefault: false, model: '', input: '', output: '', cacheRead: '', cacheWrite: '', mult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
+      rows.push({ isDefault: false, key: '', model: '', input: '', output: '', cacheRead: '', cacheWrite: '', mult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
       rerender()
     }
     body.appendChild(addBtn)
@@ -874,6 +941,21 @@
           const v = parseFloat(s)
           return Number.isFinite(v) ? v : 0
         }
+        // Reject duplicate override keys before writing anything: JSON object
+        // keys would silently collapse to the last row, losing configuration.
+        const seenKeys = new Set()
+        const duplicateKeys = []
+        for (const r of rows.slice(1)) {
+          const k = String(r.key ?? r.model ?? '').trim()
+          if (!k) continue
+          if (seenKeys.has(k)) duplicateKeys.push(k)
+          else seenKeys.add(k)
+        }
+        if (duplicateKeys.length) {
+          status.textContent =
+            '存在重复的模型键：' + [...new Set(duplicateKeys)].join('、') + '，请合并或改名后再保存'
+          return
+        }
         const defRow = rows[0]
         const def = {
           inputPerMillion: num(defRow.input),
@@ -883,8 +965,8 @@
         }
         const overrides = {}
         for (const r of rows.slice(1)) {
-          const model = String(r.model || '').trim()
-          if (!model) continue
+          const key = String(r.key ?? r.model ?? '').trim()
+          if (!key) continue
           const entry = {
             inputPerMillion: num(r.input),
             cacheReadPerMillion: num(r.cacheRead),
@@ -899,7 +981,7 @@
             if (days !== 'all') tou.days = days
             entry.timeOfUse = tou
           }
-          overrides[model] = entry
+          overrides[key] = entry
         }
         const obj = {
           exchangeRate: num(rateEl.value),
@@ -1000,6 +1082,13 @@
   }
 
   function openModal() {
+    // Freeze the usage data at the moment the dialog opens. The sidecar keeps
+    // running for the badge while closed, but its polling loop is paused until
+    // this snapshot is dismissed.
+    modalPayload = lastPayload
+    try {
+      Tauri.event.emit('usage-poll-pause').catch(() => {})
+    } catch {}
     const m = buildModal()
     m.style.display = 'flex'
     selectTab('chart')
@@ -1033,7 +1122,20 @@
 
   function closeModal() {
     if (modal) modal.style.display = 'none'
+    modalPayload = null
+    try {
+      Tauri.event.emit('usage-poll-resume').catch(() => {})
+    } catch {}
   }
+
+  // Navigation can discard the injected page without a click on the close
+  // button. Make sure a paused sidecar is resumed for the next page/session.
+  window.addEventListener('beforeunload', () => {
+    if (!modalPayload) return
+    try {
+      Tauri.event.emit('usage-poll-resume').catch(() => {})
+    } catch {}
+  })
 
   panel.addEventListener('click', openModal)
 

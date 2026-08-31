@@ -11,12 +11,15 @@
 //
 // Print protocol: one JSON object per line, e.g.
 //   {"today":{"date":"2026-08-19","cny":12.34,"usd":1.714,"requests":89,
-//             "hourly":[{hour,usd,requests,input,cacheRead,cacheWrite,output}×24], ...},
-//    "recent":[{date,usd,requests},...],"exchangeRate":7.2}
+//             "hourly":[{hour,usd,requests,input,cacheRead,cacheWrite,output}×24],
+//             "providers":[{provider,usd,requests,...,hourly:[...]}]},
+//    "recent":[{date,usd,requests,"providers":[{provider,usd,requests,...}]}],
+//    "exchangeRate":7.2}
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { zstdDecompressSync } from "node:zlib";
 
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
@@ -120,10 +123,15 @@ function matchKeys(provider, model) {
 
 function resolvePrice(pricing, provider, model) {
   const out = {};
-  for (const k of PRICE_KEYS) out[k] = pricing.default?.[k] ?? 0;
-  for (const k of matchKeys(provider, model)) {
-    const row = pricing.overrides?.[k];
-    if (row) for (const p of PRICE_KEYS) if (row[p] != null) out[p] = row[p];
+  for (const k of PRICE_KEYS) {
+    out[k] = pricing.default?.[k] ?? 0;
+    for (const key of matchKeys(provider, model)) {
+      const row = pricing.overrides?.[key];
+      if (row && row[k] != null) {
+        out[k] = row[k];
+        break;
+      }
+    }
   }
   return out;
 }
@@ -363,6 +371,76 @@ function recomputeCosts(pricing) {
   }
 }
 
+// Collapse the model buckets into provider buckets after model-specific
+// pricing has been applied. The optional hourly series is used by today's
+// chart; recent-day summaries only need daily totals.
+function summarizeProviders(dayObj, pricing, weekday, includeHourly = false) {
+  if (!dayObj) return [];
+  const providers = new Map();
+  for (const b of dayObj.values()) {
+    const providerText = b.provider == null ? "" : String(b.provider).trim();
+    const provider = providerText || UNKNOWN;
+    let summary = providers.get(provider);
+    if (!summary) {
+      summary = {
+        provider,
+        usd: 0,
+        requests: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      };
+      if (includeHourly) {
+        summary.hourly = Array.from({ length: 24 }, (_, hour) => ({
+          hour,
+          usd: 0,
+          requests: 0,
+          input: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          output: 0,
+        }));
+      }
+      providers.set(provider, summary);
+    }
+
+    summary.usd += b.estimatedCostUsd || 0;
+    summary.requests += b.requests || 0;
+    summary.input += b.input || 0;
+    summary.output += b.output || 0;
+    summary.cacheRead += b.cacheRead || 0;
+    summary.cacheWrite += b.cacheWrite || 0;
+
+    if (includeHourly && Array.isArray(b.hourly)) {
+      for (let hour = 0; hour < 24; hour++) {
+        const source = b.hourly[hour];
+        const target = summary.hourly[hour];
+        if (!source || !target) continue;
+        target.usd += hourlyCostUsd(b, hour, pricing, weekday);
+        target.requests += source.requests || 0;
+        target.input += source.input || 0;
+        target.cacheRead += source.cacheRead || 0;
+        target.cacheWrite += source.cacheWrite || 0;
+        target.output += source.output || 0;
+      }
+    }
+  }
+
+  return [...providers.values()]
+    .sort((a, b) => a.provider.localeCompare(b.provider))
+    .map((summary) => {
+      summary.usd = +summary.usd.toFixed(4);
+      if (summary.hourly) {
+        summary.hourly = summary.hourly.map((hour) => ({
+          ...hour,
+          usd: +hour.usd.toFixed(4),
+        }));
+      }
+      return summary;
+    });
+}
+
 function emit(pricing) {
   const today = dayKey(Date.now());
   const weekday = weekdayFromDayKey(today);
@@ -390,7 +468,16 @@ function emit(pricing) {
       cr += b.cacheRead;
       cw += b.cacheWrite;
     }
-    return { date: d, usd: +u.toFixed(4), requests: r, input: inp, output: out, cacheRead: cr, cacheWrite: cw };
+    return {
+      date: d,
+      usd: +u.toFixed(4),
+      requests: r,
+      input: inp,
+      output: out,
+      cacheRead: cr,
+      cacheWrite: cw,
+      providers: summarizeProviders(m, pricing, weekdayFromDayKey(d)),
+    };
   });
   // Per-hour series for today (0–24), feeding the panel's 天 (day) view.
   const hourly = Array.from({ length: 24 }, (_, h) => {
@@ -409,9 +496,21 @@ function emit(pricing) {
     }
     return { hour: h, usd: +u.toFixed(4), requests: r, input: inp, cacheRead: cr, cacheWrite: cw, output: out };
   });
+  const providers = summarizeProviders(dayObj, pricing, weekday, true);
   console.log(
     JSON.stringify({
-      today: { date: today, cny: +(usd * pricing.exchangeRate).toFixed(2), usd: +usd.toFixed(4), requests, input, output, cacheRead, cacheWrite, hourly },
+      today: {
+        date: today,
+        cny: +(usd * pricing.exchangeRate).toFixed(2),
+        usd: +usd.toFixed(4),
+        requests,
+        input,
+        output,
+        cacheRead,
+        cacheWrite,
+        hourly,
+        providers,
+      },
       recent,
       exchangeRate: pricing.exchangeRate,
     }),
@@ -420,6 +519,7 @@ function emit(pricing) {
 
 let timer = null;
 let currentMs = POLL_MS;
+let paused = false;
 
 function refresh() {
   for (const f of logFiles(sessionsRoot())) foldSession(f);
@@ -431,18 +531,60 @@ function refresh() {
   const ms = Number(pricing.pollMs) || POLL_MS;
   if (ms !== currentMs) {
     currentMs = ms;
-    clearInterval(timer);
-    timer = setInterval(refresh, ms);
+    startTimer();
   }
 }
 
-refresh();
-timer = setInterval(refresh, currentMs);
+// At most one timer exists at any time: startTimer always clears the previous
+// interval first, so re-creating it (pollMs change, resume, startup) can never
+// leak a second timer that `pause` would then be unable to stop.
+function stopTimer() {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+}
+
+function startTimer() {
+  stopTimer();
+  if (!paused) timer = setInterval(refresh, currentMs);
+}
+
+// Refresh is best-effort: a throw must never kill the polling loop, or a
+// pause/resume cycle could leave the sidecar silent until restart.
+function refreshSafe() {
+  try {
+    refresh();
+  } catch (err) {
+    process.stderr.write("usage sidecar: refresh failed: " + ((err && err.stack) || err) + "\n");
+  }
+}
+
+// The desktop shell pauses this loop while the usage dialog is open so the
+// dialog remains a snapshot of the data captured at open time. The sidecar
+// resumes on close and immediately emits a fresh aggregate.
+const control = createInterface({ input: process.stdin });
+control.on("line", (line) => {
+  const command = line.trim().toLowerCase();
+  if (command === "pause") {
+    paused = true;
+    stopTimer();
+  } else if (command === "resume") {
+    if (!paused) return;
+    paused = false;
+    refreshSafe();
+    startTimer();
+  }
+});
+control.on("close", () => process.exit(0));
+
+refreshSafe();
+startTimer();
 process.on("SIGINT", () => {
-  clearInterval(timer);
+  stopTimer();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
-  clearInterval(timer);
+  stopTimer();
   process.exit(0);
 });
