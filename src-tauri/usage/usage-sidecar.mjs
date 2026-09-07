@@ -415,7 +415,7 @@ function recomputeCosts(pricing) {
 
 // Collapse the model buckets into provider buckets after model-specific
 // pricing has been applied. The optional hourly series is used by today's
-// chart; recent-day summaries only need daily totals.
+// chart; historical summaries only need daily totals.
 function summarizeProviders(dayObj, pricing, weekday, includeHourly = false) {
   if (!dayObj) return [];
   const providers = new Map();
@@ -498,7 +498,9 @@ function emit(pricing) {
       cacheWrite += b.cacheWrite;
     }
   }
-  const dayList = [...days.keys()].sort().reverse().slice(0, 30); // newest first, up to 30 days
+  // Keep enough daily rows for the panel's rolling 12-calendar-month view.
+  // 370 covers leap years and month-boundary gaps while keeping the payload small.
+  const dayList = [...days.keys()].sort().reverse().slice(0, 370); // newest first
   const recent = dayList.map((d) => {
     let u = 0, r = 0, inp = 0, out = 0, cr = 0, cw = 0;
     const m = days.get(d);

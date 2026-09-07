@@ -27,7 +27,8 @@
   const panel = document.createElement('div')
   panel.id = 'deepseek-harness-usage'
   panel.style.cssText =
-    'position:fixed;left:76px;bottom:14px;z-index:2147483646;' +
+    // Keep the badge above ordinary page content, but below dsh's own menus and settings panels.
+    'position:fixed;left:76px;bottom:14px;z-index:100;' +
     'display:inline-block;padding:5px 14px 5px 10px;border-radius:999px;' +
     'background:linear-gradient(180deg,#ffffff,#f3f5f8);color:#1f2328;white-space:nowrap;' +
     'border:1px solid #d0d7de;' +
@@ -325,7 +326,7 @@
     return d
   }
 
-  let chartRange = 'day' // 'day' | 'week' | 'month'
+  let chartRange = 'day' // 'day' | 'week' | 'month' | 'year'
   let chartInstance = null
   let providerFilter = '' // empty = all providers
 
@@ -363,6 +364,32 @@
       cacheWrite: row.cacheWrite,
       output: row.output,
     }
+  }
+
+  // Build twelve calendar-month points from the daily summaries. Missing months
+  // stay visible as zeroes so the annual chart always covers a full year.
+  function annualPoints(recent) {
+    const now = new Date()
+    const months = []
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+      const key = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
+      months.push({ key, label: key.slice(2), title: d.getFullYear() + '年' + (d.getMonth() + 1) + '月' })
+    }
+    const totals = new Map(months.map((m) => [m.key, { usd: 0, requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }]))
+    for (const day of recent) {
+      const key = String(day.date || '').slice(0, 7)
+      const total = totals.get(key)
+      if (!total) continue
+      const row = providerSummary(day) || {}
+      total.usd += Number(row.usd) || 0
+      total.requests += Number(row.requests) || 0
+      total.input += Number(row.input) || 0
+      total.cacheRead += Number(row.cacheRead) || 0
+      total.cacheWrite += Number(row.cacheWrite) || 0
+      total.output += Number(row.output) || 0
+    }
+    return months.map((m) => usagePoint(totals.get(m.key), m.label, m.title))
   }
 
   function renderChartTab() {
@@ -408,7 +435,7 @@
     filterRow.appendChild(filter)
     modalContent.appendChild(filterRow)
 
-    // 天 / 周 / 月 range toggle.
+    // 天 / 周 / 月 / 年 range toggle.
     const bar = document.createElement('div')
     bar.style.cssText = 'display:flex;gap:6px;margin-bottom:2px;'
     const mk = (label, range) => {
@@ -426,9 +453,10 @@
     bar.appendChild(mk('天', 'day'))
     bar.appendChild(mk('周', 'week'))
     bar.appendChild(mk('月', 'month'))
+    bar.appendChild(mk('年', 'year'))
     modalContent.appendChild(bar)
 
-    // Series data: 天 = today's 0–24 hourly; 周/月 = recent days (chronological).
+    // Series data: 天 = today's 0–24 hourly; 周/月 = recent days; 年 = calendar months.
     let points = []
     let rangeLabel = ''
     if (chartRange === 'day') {
@@ -443,6 +471,9 @@
         ),
       )
       rangeLabel = '今日'
+    } else if (chartRange === 'year') {
+      points = annualPoints(recent)
+      rangeLabel = '近 12 个月'
     } else {
       const limit = chartRange === 'month' ? 30 : 7
       points = recent
@@ -462,7 +493,7 @@
     const reqs = points.map((p) => Number(p.requests) || 0)
     const hit = points.map((p) => +hitRateOf(p).toFixed(1))
 
-    // ── range totals: day / week / month summary above the chart ──
+    // ── range totals: day / week / month / year summary above the chart ──
     const totalUsd = points.reduce((s, p) => s + (Number(p.usd) || 0), 0)
     const totalTok = points.reduce((s, p) => s + totalTokens(p), 0)
     const totalReq = points.reduce((s, p) => s + (Number(p.requests) || 0), 0)

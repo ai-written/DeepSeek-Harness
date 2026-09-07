@@ -81,7 +81,7 @@ npm run build
 
 ## 每日用量徽标
 
-主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日用量图表（含金额、token、请求数、缓存命中率合计），可按会话日志中的 `provider` 字段筛选供应商，并编辑汇率与单价。
+主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日 / 近 12 个月用量图表（含金额、token、请求数、缓存命中率合计），可按会话日志中的 `provider` 字段筛选供应商，并编辑汇率与单价。
 
 - **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 zstd），按 `provider` / 模型分桶并每 3 秒增量刷新；打开用量弹窗时暂停轮询，以弹窗打开瞬间的数据为准，关闭后立即恢复；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染
 - **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率与峰时时段计价；sidecar 每次刷新重读，改动即时生效
