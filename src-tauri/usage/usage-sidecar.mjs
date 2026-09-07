@@ -6,8 +6,9 @@
 // it to the in-window usage panel. Reads ~/.dsh/storages/usage-pricing.json for
 // prices + exchange rate (re-read each emit so edits apply live).
 //
-// Runs in memory: keeps per-session fold cursors and re-folds only appended
-// tails, so each poll is cheap. No checkpoint file written.
+// Persists raw per-session aggregates in usage-cache.json. On later starts it
+// re-reads only logs whose size/mtime/path changed; deleted logs keep their
+// cached aggregates by design. Prices are always recomputed from raw usage.
 //
 // Print protocol: one JSON object per line, e.g.
 //   {"today":{"date":"2026-08-19","cny":12.34,"usd":1.714,"requests":89,
@@ -18,7 +19,7 @@
 // Every `usd` field holds the amount in the configured total currency
 // (totalCurrency: "usd" | "cny"); `cny` is always the CNY badge value.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -298,10 +299,161 @@ function multiplierFor(weekday, hour, tou) {
   return tou.valleyMultiplier ?? 1;
 }
 
+// Persistent cache: raw token/request aggregates are stored per session. Prices
+// are intentionally not cached, so changing pricing can be applied immediately.
+const CACHE_VERSION = 1;
+const usageCachePath = () => join(dshHome(), "storages", "usage-cache.json");
+const sessionRecords = new Map();
 // days: Map<date, Map<"provider|model", bucket>>
 const days = new Map();
-// cursors: Map<sessionId, { seq, provider, model, fileSize }>
+// cursors: Map<sessionId, { seq, provider, model, fileSize, fileMtimeMs }>
 const cursors = new Map();
+
+function emptyBucket(provider, model) {
+  return { provider, model, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, requests: 0, estimatedCostUsd: 0, hourly: initHourly() };
+}
+
+function addBucket(target, source) {
+  target.input += Number(source?.input) || 0;
+  target.cacheRead += Number(source?.cacheRead) || 0;
+  target.cacheWrite += Number(source?.cacheWrite) || 0;
+  target.output += Number(source?.output) || 0;
+  target.requests += Number(source?.requests) || 0;
+  if (!Array.isArray(target.hourly)) target.hourly = initHourly();
+  if (Array.isArray(source?.hourly)) {
+    for (let hour = 0; hour < 24; hour++) {
+      const from = source.hourly[hour];
+      const to = target.hourly[hour];
+      if (!from || !to) continue;
+      to.input += Number(from.input) || 0;
+      to.cacheRead += Number(from.cacheRead) || 0;
+      to.cacheWrite += Number(from.cacheWrite) || 0;
+      to.output += Number(from.output) || 0;
+      to.requests += Number(from.requests) || 0;
+    }
+  }
+}
+
+function mergeSessionDays() {
+  days.clear();
+  for (const record of sessionRecords.values()) {
+    for (const [date, sourceDay] of record.days ?? []) {
+      let targetDay = days.get(date);
+      if (!targetDay) {
+        targetDay = new Map();
+        days.set(date, targetDay);
+      }
+      for (const [key, source] of sourceDay) {
+        const target = targetDay.get(key) ?? emptyBucket(source.provider, source.model);
+        addBucket(target, source);
+        targetDay.set(key, target);
+      }
+    }
+  }
+}
+
+function deserializeSession(record) {
+  if (!record || typeof record !== "object" || !record.days || typeof record.days !== "object") return null;
+  const daysMap = new Map();
+  for (const [date, sourceDay] of Object.entries(record.days)) {
+    if (!sourceDay || typeof sourceDay !== "object") continue;
+    const dayMap = new Map();
+    for (const [key, source] of Object.entries(sourceDay)) {
+      if (!source || typeof source !== "object") continue;
+      const bucket = emptyBucket(String(source.provider ?? UNKNOWN), String(source.model ?? UNKNOWN));
+      addBucket(bucket, source);
+      dayMap.set(key, bucket);
+    }
+    daysMap.set(date, dayMap);
+  }
+  return {
+    path: String(record.path ?? ""),
+    fileSize: Number(record.fileSize) || 0,
+    fileMtimeMs: Number(record.fileMtimeMs) || 0,
+    seq: Number(record.seq) || -1,
+    provider: record.provider ?? null,
+    model: record.model ?? null,
+    days: daysMap,
+  };
+}
+
+function loadUsageCache() {
+  try {
+    const raw = JSON.parse(readFileSync(usageCachePath(), "utf8"));
+    if (raw?.version !== CACHE_VERSION || !raw.sessions || typeof raw.sessions !== "object") return;
+    for (const [sessionId, source] of Object.entries(raw.sessions)) {
+      const record = deserializeSession(source);
+      if (!record) continue;
+      sessionRecords.set(sessionId, record);
+      cursors.set(sessionId, {
+        seq: record.seq,
+        provider: record.provider,
+        model: record.model,
+        fileSize: record.fileSize,
+        fileMtimeMs: record.fileMtimeMs,
+        path: record.path,
+      });
+    }
+    mergeSessionDays();
+  } catch {
+    // Missing or corrupt cache is safe: the normal log scan rebuilds it.
+  }
+}
+
+function serializeSession(record) {
+  const outDays = {};
+  for (const [date, sourceDay] of record.days ?? []) {
+    outDays[date] = {};
+    for (const [key, bucket] of sourceDay) {
+      const { estimatedCostUsd, ...raw } = bucket;
+      outDays[date][key] = raw;
+    }
+  }
+  return {
+    path: record.path,
+    fileSize: record.fileSize,
+    fileMtimeMs: record.fileMtimeMs,
+    seq: record.seq,
+    provider: record.provider,
+    model: record.model,
+    days: outDays,
+  };
+}
+
+function saveUsageCache() {
+  const path = usageCachePath();
+  let temp = null;
+  try {
+    mkdirSync(join(dshHome(), "storages"), { recursive: true });
+    const sessions = {};
+    for (const [sessionId, record] of sessionRecords) sessions[sessionId] = serializeSession(record);
+    temp = `${path}.tmp-${process.pid}`;
+    writeFileSync(temp, JSON.stringify({ version: CACHE_VERSION, sessions }));
+    try {
+      renameSync(temp, path);
+      temp = null;
+    } catch (renameError) {
+      // Windows cannot replace an existing file with renameSync. Remove the
+      // old cache only after the complete temporary file has been written.
+      try {
+        unlinkSync(path);
+        renameSync(temp, path);
+        temp = null;
+      } catch (replaceError) {
+        throw replaceError ?? renameError;
+      }
+    }
+  } catch (err) {
+    if (temp) {
+      try {
+        unlinkSync(temp);
+      } catch {
+        // Best-effort cleanup only.
+      }
+    }
+    process.stderr.write("usage sidecar: cache save failed: " + ((err && err.message) || err) + "\n");
+  }
+}
 
 function logFiles(dir, out = []) {
   let entries;
@@ -324,26 +476,26 @@ function sessionIdFromLogPath(p) {
 
 function foldSession(file) {
   const sessionId = sessionIdFromLogPath(file);
-  let size;
+  let metadata;
   try {
-    size = statSync(file).size;
+    const stat = statSync(file);
+    metadata = { size: stat.size, mtimeMs: stat.mtimeMs || 0 };
   } catch {
-    return;
+    return false;
   }
   const cur = cursors.get(sessionId);
-  if (cur && cur.fileSize === size) return; // skip-EOF: no new data
+  if (cur && cur.fileSize === metadata.size && cur.fileMtimeMs === metadata.mtimeMs && cur.path === file) return false;
   let buf;
   try {
     buf = readFileSync(file);
   } catch {
-    return;
+    return false;
   }
   const text = /\.zstd$/i.test(file) ? decodeMultiFrame(buf) : buf.toString("utf8");
   const lines = text.split("\n").filter(Boolean);
-
-  const startSeq = cur?.seq ?? -1;
-  let provider = cur?.provider ?? null;
-  let model = cur?.model ?? null;
+  const sessionDays = new Map();
+  let provider = null;
+  let model = null;
   let maxSeq = -1;
 
   for (const line of lines) {
@@ -355,8 +507,6 @@ function foldSession(file) {
     }
     const seq = typeof ev?.seq === "number" ? ev.seq : -1;
     if (seq > maxSeq) maxSeq = seq;
-    if (seq <= startSeq) continue;
-
     const t = ev.type;
     const d = ev.data ?? {};
     if (t === "request/header") {
@@ -373,37 +523,50 @@ function foldSession(file) {
         const mm = model ?? UNKNOWN;
         const key = `${pm}|${mm}`;
         const date = dayKey(ev.time);
-        let dayObj = days.get(date);
+        let dayObj = sessionDays.get(date);
         if (!dayObj) {
           dayObj = new Map();
-          days.set(date, dayObj);
+          sessionDays.set(date, dayObj);
         }
-        const b =
-          dayObj.get(key) ??
-          { provider: pm, model: mm, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, requests: 0, estimatedCostUsd: 0, hourly: initHourly() };
-        const inp = u.inputTokens ?? 0;
-        const cr = u.cacheReadTokens ?? 0;
-        const cw = u.cacheWriteTokens ?? 0;
-        const out = u.outputTokens ?? 0;
+        const b = dayObj.get(key) ?? emptyBucket(pm, mm);
+        const inp = Number(u.inputTokens) || 0;
+        const cr = Number(u.cacheReadTokens) || 0;
+        const cw = Number(u.cacheWriteTokens) || 0;
+        const out = Number(u.outputTokens) || 0;
         b.input += inp;
         b.cacheRead += cr;
         b.cacheWrite += cw;
         b.output += out;
         b.requests += 1;
-        const hc = Array.isArray(b.hourly) ? b.hourly[localHour(ev.time)] : null;
-        if (hc) {
-          hc.input += inp;
-          hc.cacheRead += cr;
-          hc.cacheWrite += cw;
-          hc.output += out;
-          hc.requests = (hc.requests || 0) + 1;
-        }
+        const hc = b.hourly[localHour(ev.time)];
+        hc.input += inp;
+        hc.cacheRead += cr;
+        hc.cacheWrite += cw;
+        hc.output += out;
+        hc.requests += 1;
         dayObj.set(key, b);
       }
     }
   }
 
-  cursors.set(sessionId, { seq: maxSeq, provider, model, fileSize: size });
+  sessionRecords.set(sessionId, {
+    path: file,
+    fileSize: metadata.size,
+    fileMtimeMs: metadata.mtimeMs,
+    seq: maxSeq,
+    provider,
+    model,
+    days: sessionDays,
+  });
+  cursors.set(sessionId, {
+    seq: maxSeq,
+    provider,
+    model,
+    fileSize: metadata.size,
+    fileMtimeMs: metadata.mtimeMs,
+    path: file,
+  });
+  return true;
 }
 
 function recomputeCosts(pricing) {
@@ -568,12 +731,57 @@ function emit(pricing) {
 let timer = null;
 let currentMs = POLL_MS;
 let paused = false;
+let cacheLoaded = false;
+let cacheDirty = false;
+let cacheSaveTimer = null;
+
+function scheduleCacheSave() {
+  cacheDirty = true;
+  if (cacheSaveTimer) return;
+  cacheSaveTimer = setTimeout(() => {
+    cacheSaveTimer = null;
+    if (cacheDirty) {
+      cacheDirty = false;
+      saveUsageCache();
+    }
+  }, 1000);
+}
+
+function flushUsageCache() {
+  if (cacheSaveTimer) {
+    clearTimeout(cacheSaveTimer);
+    cacheSaveTimer = null;
+  }
+  if (cacheDirty) {
+    cacheDirty = false;
+    saveUsageCache();
+  }
+}
 
 function refresh() {
-  for (const f of logFiles(sessionsRoot())) foldSession(f);
   const pricing = loadPricing();
+  let emittedCachedSnapshot = false;
+  if (!cacheLoaded) {
+    loadUsageCache();
+    cacheLoaded = true;
+    // Emit the persisted snapshot before touching the log contents. This makes
+    // the badge and historical charts available immediately on later starts.
+    recomputeCosts(pricing);
+    if (sessionRecords.size > 0) {
+      emit(pricing);
+      emittedCachedSnapshot = true;
+    }
+  }
+  let changed = false;
+  for (const f of logFiles(sessionsRoot())) changed = foldSession(f) || changed;
+  if (changed) {
+    mergeSessionDays();
+    scheduleCacheSave();
+  }
   recomputeCosts(pricing);
-  emit(pricing);
+  // A cache hit with no changed files was already emitted above. Avoid sending
+  // the same payload twice; changed files still trigger the corrected snapshot.
+  if (!emittedCachedSnapshot || changed) emit(pricing);
   // Dynamic poll interval: a `pollMs` in the pricing config overrides the env
   // default (and takes effect on the next refresh without a restart).
   const ms = Number(pricing.pollMs) || POLL_MS;
@@ -624,15 +832,20 @@ control.on("line", (line) => {
     startTimer();
   }
 });
-control.on("close", () => process.exit(0));
+control.on("close", () => {
+  flushUsageCache();
+  process.exit(0);
+});
 
 refreshSafe();
 startTimer();
 process.on("SIGINT", () => {
   stopTimer();
+  flushUsageCache();
   process.exit(0);
 });
 process.on("SIGTERM", () => {
   stopTimer();
+  flushUsageCache();
   process.exit(0);
 });
