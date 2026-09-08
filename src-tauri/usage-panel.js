@@ -730,6 +730,8 @@
         cacheWrite: blank.default?.cacheWritePerMillion,
         currency: blank.default?.currency || 'cny',
         mult: blank.multiplier ?? 1,
+        contextThreshold: blank.contextMultiplier?.threshold,
+        contextMult: blank.contextMultiplier?.multiplier,
         peakRanges: Array.isArray(defTou.peakRanges) ? defTou.peakRanges.map((r) => r.join('-')).join(', ') : '',
         peakMultiplier: defTou.peakMultiplier,
         days: defDays,
@@ -753,6 +755,8 @@
         cacheWrite: v.cacheWritePerMillion,
         currency: v.currency || 'cny',
         mult: v.multiplier,
+        contextThreshold: v.contextMultiplier?.threshold,
+        contextMult: v.contextMultiplier?.multiplier,
         peakRanges: Array.isArray(tou.peakRanges) ? tou.peakRanges.map((r) => r.join('-')).join(', ') : '',
         peakMultiplier: tou.peakMultiplier,
         days: nd,
@@ -762,14 +766,14 @@
     }
 
     // ── table ──
-    body.appendChild(label('单价维护（$ / 百万 token，计价单位可逐模型选美元或人民币，人民币按当前汇率换算；峰时时间留空=不启用；峰时日期默认每天，可选工作日/周末/自定义）', '#e6edf3'))
+    body.appendChild(label('单价维护（$ / 百万 token，计价单位可逐模型选美元或人民币，人民币按当前汇率换算；上下文阈值/倍率：单次请求输入+缓存 token 严格大于阈值即整单乘该倍率，阈值单位为 token、支持 K/M/B 后缀（如 128K=128000），留空=不启用；峰时时间留空=不启用；峰时日期默认每天，可选工作日/周末/自定义）', '#e6edf3'))
     const wrap = document.createElement('div')
     wrap.style.cssText = 'overflow-x:auto;'
     const table = document.createElement('table')
     table.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;'
     const thead = document.createElement('thead')
     const trh = document.createElement('tr')
-    for (const h of ['模型', '计价单位', '输入', '输出', '缓存读取', '缓存写入', '模型倍率', '峰时时间', '峰时日期', '峰时倍率', '']) {
+    for (const h of ['模型', '计价单位', '输入', '输出', '缓存读取', '缓存写入', '模型倍率', '上下文阈值', '上下文倍率', '峰时时间', '峰时日期', '峰时倍率', '']) {
       const th = document.createElement('th')
       th.textContent = h
       th.style.cssText = 'padding:4px 6px;text-align:left;color:#57606a;font-weight:600;border-bottom:1px solid #d0d7de;white-space:nowrap;'
@@ -853,6 +857,23 @@
           r.mult = multInp.value
         }
         tdMult.appendChild(multInp)
+        // Context tier columns: a request is surcharged when input plus cache
+        // tokens is strictly above the configured threshold.
+        const tdContextThreshold = document.createElement('td')
+        const contextThresholdInp = textInput(r.contextThreshold, '88px')
+        contextThresholdInp.placeholder = '如 128000 或 128K'
+        contextThresholdInp.title = '上下文阈值（token），支持 K/M/B 后缀，如 128000、128K、1.5M、2B'
+        contextThresholdInp.oninput = () => {
+          r.contextThreshold = contextThresholdInp.value
+        }
+        tdContextThreshold.appendChild(contextThresholdInp)
+        const tdContextMult = document.createElement('td')
+        const contextMultInp = cellInput(r.contextMult, '56px')
+        contextMultInp.placeholder = '1'
+        contextMultInp.oninput = () => {
+          r.contextMult = contextMultInp.value
+        }
+        tdContextMult.appendChild(contextMultInp)
         // peak/valley columns
         const tdR = document.createElement('td')
         const rangesInp = textInput(r.peakRanges, '130px')
@@ -948,6 +969,8 @@
         tr.appendChild(mk('cacheRead'))
         tr.appendChild(mk('cacheWrite'))
         tr.appendChild(tdMult)
+        tr.appendChild(tdContextThreshold)
+        tr.appendChild(tdContextMult)
         tr.appendChild(tdR)
         tr.appendChild(tdDays)
         tr.appendChild(tdP)
@@ -961,7 +984,7 @@
     const addBtn = makeButton('＋ 添加模型', 'secondary')
     addBtn.style.cssText += 'margin-top:8px;padding:5px 14px;font-size:12px;'
     addBtn.onclick = () => {
-      rows.push({ isDefault: false, key: '', model: '', input: '', output: '', cacheRead: '', cacheWrite: '', currency: 'cny', mult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
+      rows.push({ isDefault: false, key: '', model: '', input: '', output: '', cacheRead: '', cacheWrite: '', currency: 'cny', mult: '', contextThreshold: '', contextMult: '', peakRanges: '', peakMultiplier: '', days: 'all', customDays: null })
       rerender()
     }
     body.appendChild(addBtn)
@@ -1015,6 +1038,38 @@
           const v = parseFloat(s)
           return Number.isFinite(v) ? v : 0
         }
+        // Token count parser mirroring the sidecar: plain number or a K/M/B
+        // suffix string ("128000", "128K", "1.5M", "2B"). NaN = unparseable.
+        const parseTokenCount = (value) => {
+          if (typeof value === 'number') return Number.isFinite(value) ? value : NaN
+          const text = String(value ?? '').trim()
+          if (!text) return NaN
+          const m = /^(\d+(?:\.\d+)?)\s*([kKmMbB]?)$/.exec(text)
+          if (!m) return NaN
+          const suffix = m[2] ? m[2].toLowerCase() : ''
+          const scale = suffix === 'k' ? 1e3 : suffix === 'm' ? 1e6 : suffix === 'b' ? 1e9 : 1
+          return parseFloat(m[1]) * scale
+        }
+        // Threshold value kept as typed so the table never shows huge numbers:
+        // a compact suffix string ("128K", "1.5M", "2B") is stored as-is and
+        // only converted to tokens at calculation time (sidecar parses both
+        // strings and numbers). A pure digit entry is stored as a number.
+        const normalizeThreshold = (raw) => {
+          const text = String(raw ?? '').trim()
+          if (!text) return null
+          const tokens = parseTokenCount(text)
+          if (!Number.isFinite(tokens) || tokens < 0) return null
+          if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text)
+          return text.replace(/\s+/g, '').replace(/[kmb]$/i, (s) => s.toUpperCase())
+        }
+        // Context tier rule from the two dedicated columns. A rule is written
+        // only when both fields are valid; the multiplier must be positive.
+        const contextRule = (row) => {
+          const threshold = normalizeThreshold(row.contextThreshold)
+          const multiplier = parseFloat(row.contextMult)
+          if (threshold == null || !Number.isFinite(multiplier) || multiplier <= 0) return null
+          return { threshold, multiplier }
+        }
         // Reject duplicate override keys before writing anything: JSON object
         // keys would silently collapse to the last row, losing configuration.
         const seenKeys = new Set()
@@ -1050,6 +1105,8 @@
             currency: r.currency === 'cny' ? 'cny' : 'usd',
             multiplier: num(r.mult) || 1,
           }
+          const ctxRule = contextRule(r)
+          if (ctxRule) entry.contextMultiplier = ctxRule
           const ranges = parseRanges(r.peakRanges)
           if (ranges.length) {
             const tou = { enabled: true, peakMultiplier: peakMult(r.peakMultiplier), valleyMultiplier: 1, peakRanges: ranges }
@@ -1067,6 +1124,8 @@
           multiplier: num(defRow.mult) || 1,
           totalCurrency: curSel.value === 'cny' ? 'cny' : 'usd',
         }
+        const defCtxRule = contextRule(defRow)
+        if (defCtxRule) obj.contextMultiplier = defCtxRule
         const defRanges = parseRanges(defRow.peakRanges)
         if (defRanges.length) {
           const tou = { enabled: true, peakMultiplier: peakMult(defRow.peakMultiplier), valleyMultiplier: 1, peakRanges: defRanges }
@@ -1098,6 +1157,7 @@
     timeOfUse: undefined,
     pollMs: undefined,
     multiplier: 1,
+    contextMultiplier: undefined,
     totalCurrency: 'cny',
   }
   let blank = { ...defaultPricing, default: { ...defaultPricing.default } }
@@ -1154,6 +1214,7 @@
         timeOfUse: p.timeOfUse,
         pollMs: p.pollMs,
         multiplier: p.multiplier ?? 1,
+        contextMultiplier: p.contextMultiplier,
         totalCurrency: p.totalCurrency,
       }
     } catch {

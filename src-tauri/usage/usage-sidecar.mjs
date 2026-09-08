@@ -116,6 +116,7 @@ function loadPricing() {
       timeOfUse: u.timeOfUse,
       pollMs: u.pollMs,
       multiplier: u.multiplier ?? DEFAULT_TEMPLATE.multiplier,
+      contextMultiplier: u.contextMultiplier,
       totalCurrency: u.totalCurrency ?? DEFAULT_TEMPLATE.totalCurrency,
     };
   } catch {
@@ -172,6 +173,17 @@ function modelMultiplier(pricing, provider, model) {
   return pricing.multiplier ?? 1;
 }
 
+// Per-model context multiplier: an override row wins, otherwise use the
+// default-row rule. The rule applies only when a request's input plus cache
+// tokens are strictly above its threshold.
+function modelContextMultiplier(pricing, provider, model) {
+  for (const k of matchKeys(provider, model)) {
+    const row = pricing.overrides?.[k];
+    if (row && row.contextMultiplier != null) return row.contextMultiplier;
+  }
+  return pricing.contextMultiplier;
+}
+
 // Per-model price currency: an override row's own currency wins (model-name
 // row first), otherwise the default row's currency, defaulting to CNY.
 function resolveCurrency(pricing, provider, model) {
@@ -198,47 +210,95 @@ function convertCost(cost, from, pricing) {
   return from === "cny" ? cost / (pricing.exchangeRate || 1) : cost * (pricing.exchangeRate || 1);
 }
 
-/// Cost of one hour's tokens for a bucket: that hour's time-of-use multiplier
-/// and the model multiplier applied. Shared by costUsd (bucket total) and the
-/// per-hour series emitted to the panel's day view. The result is expressed in
-/// the configured total currency (see totalCurrencyOf).
-function hourlyCostUsd(bucket, hour, pricing, weekday = flatWeekday()) {
-  const p = resolvePrice(pricing, bucket.provider, bucket.model);
-  const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
-  const m = bucket.hourly?.[hour];
-  if (!m) return 0;
-  const mult = multiplierFor(weekday, hour, modelTimeOfUse(pricing, bucket.provider, bucket.model));
-  const cost =
-    ((m.input / 1e6) * p.inputPerMillion +
-      (m.cacheRead / 1e6) * p.cacheReadPerMillion +
-      (m.cacheWrite / 1e6) * p.cacheWritePerMillion +
-      (m.output / 1e6) * p.outputPerMillion) *
-    mult *
-    mm;
-  return convertCost(cost, resolveCurrency(pricing, bucket.provider, bucket.model), pricing);
+function tokenCost(tokens, price) {
+  return (
+    ((Number(tokens.input) || 0) / 1e6) * price.inputPerMillion +
+    ((Number(tokens.cacheRead) || 0) / 1e6) * price.cacheReadPerMillion +
+    ((Number(tokens.cacheWrite) || 0) / 1e6) * price.cacheWritePerMillion +
+    ((Number(tokens.output) || 0) / 1e6) * price.outputPerMillion
+  );
+}
+
+// DSH records uncached input and cache usage as disjoint values. Their sum is
+// the input context used by its own tiered-price calculation.
+function contextTokens(tokens) {
+  return (Number(tokens.input) || 0) + (Number(tokens.cacheRead) || 0) + (Number(tokens.cacheWrite) || 0);
+}
+
+// Token count parser: accepts a plain number, a numeric string, or a compact
+// string with a K / M / B suffix (case-insensitive, optional whitespace), e.g.
+// "128000", "128K", "1.5M", "2b". Returns NaN for anything unparseable.
+function parseTokenCount(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  const text = String(value ?? "").trim();
+  if (!text) return NaN;
+  const m = /^(\d+(?:\.\d+)?)\s*([kKmMbB]?)$/.exec(text);
+  if (!m) return NaN;
+  const suffix = m[2] ? m[2].toLowerCase() : "";
+  const scale = suffix === "k" ? 1e3 : suffix === "m" ? 1e6 : suffix === "b" ? 1e9 : 1;
+  return parseFloat(m[1]) * scale;
+}
+
+function contextMultiplierFor(pricing, provider, model, tokens) {
+  const rule = modelContextMultiplier(pricing, provider, model);
+  const threshold = parseTokenCount(rule?.threshold);
+  const multiplier = Number(rule?.multiplier);
+  if (!Number.isFinite(threshold) || threshold <= 0 || !Number.isFinite(multiplier) || multiplier <= 0) return 1;
+  return contextTokens(tokens) > threshold ? multiplier : 1;
+}
+
+// Cost of a per-request usage record: time-of-use, model multiplier and the
+// context-tier rule all apply per request.
+function usageCostUsd(tokens, provider, model, hour, pricing, weekday) {
+  const price = resolvePrice(pricing, provider, model);
+  const timeMultiplier = multiplierFor(weekday, hour, modelTimeOfUse(pricing, provider, model));
+  const modelMultiplierValue = modelMultiplier(pricing, provider, model);
+  const contextMultiplierValue = contextMultiplierFor(pricing, provider, model, tokens);
+  const cost = tokenCost(tokens, price) * timeMultiplier * modelMultiplierValue * contextMultiplierValue;
+  return convertCost(cost, resolveCurrency(pricing, provider, model), pricing);
+}
+
+// Legacy cost for aggregate token totals (v1 caches, or the pre-upgrade fold):
+// no per-request context is known, so it prices exactly as before the
+// context-tier feature (time-of-use × model multiplier only).
+function legacyCostUsd(tokens, provider, model, hour, pricing, weekday) {
+  const price = resolvePrice(pricing, provider, model);
+  const timeMultiplier = multiplierFor(weekday, hour, modelTimeOfUse(pricing, provider, model));
+  const cost = tokenCost(tokens, price) * timeMultiplier * modelMultiplier(pricing, provider, model);
+  return convertCost(cost, resolveCurrency(pricing, provider, model), pricing);
+}
+
+/// Per-hour cost array (0..23) for a bucket in a single pass over its records,
+/// so the day chart and provider summaries never rescan the per-request list
+/// once per hour. New caches retain per-request usage and evaluate the
+/// context-tier multiplier exactly; legacy cache entries use their aggregate
+/// tokens and retain their former (pre-context-tier) pricing behavior.
+function bucketHourlyCostsUsd(bucket, pricing, weekday) {
+  const out = new Array(24).fill(0);
+  if (Array.isArray(bucket.usageRecords)) {
+    for (const usage of bucket.usageRecords) {
+      let hour = Number.isInteger(usage?.hour) ? usage.hour : flatHour();
+      if (hour < 0 || hour > 23) hour = flatHour();
+      out[hour] += usageCostUsd(usage, bucket.provider, bucket.model, hour, pricing, weekday);
+    }
+    return out;
+  }
+  for (let hour = 0; hour < 24; hour++) {
+    const tokens = bucket.hourly?.[hour];
+    out[hour] = tokens ? legacyCostUsd(tokens, bucket.provider, bucket.model, hour, pricing, weekday) : 0;
+  }
+  return out;
 }
 
 function costUsd(bucket, pricing, weekday = flatWeekday()) {
-  // If the bucket carries hourly token splits, price per hour so peak/valley
-  // time-of-use multipliers apply; otherwise fall back to flat pricing.
-  const h = bucket.hourly;
-  if (h && Array.isArray(h) && h.length === 24) {
-    let total = 0;
-    for (let hour = 0; hour < 24; hour++) total += hourlyCostUsd(bucket, hour, pricing, weekday);
-    return total;
+  // Aggregate-shaped bucket (no hourly splits, no per-request list): price the
+  // whole bucket flat at the current hour, as before.
+  if (!Array.isArray(bucket.hourly) && !Array.isArray(bucket.usageRecords)) {
+    return legacyCostUsd(bucket, bucket.provider, bucket.model, flatHour(), pricing, flatWeekday());
   }
-  const p = resolvePrice(pricing, bucket.provider, bucket.model);
-  const tou = modelTimeOfUse(pricing, bucket.provider, bucket.model);
-  const mm = modelMultiplier(pricing, bucket.provider, bucket.model);
-  const mult = multiplierFor(flatWeekday(), flatHour(), tou);
-  const cost =
-    ((bucket.input / 1e6) * p.inputPerMillion +
-      (bucket.cacheRead / 1e6) * p.cacheReadPerMillion +
-      (bucket.cacheWrite / 1e6) * p.cacheWritePerMillion +
-      (bucket.output / 1e6) * p.outputPerMillion) *
-    mult *
-    mm;
-  return convertCost(cost, resolveCurrency(pricing, bucket.provider, bucket.model), pricing);
+  let total = 0;
+  for (const hourCost of bucketHourlyCostsUsd(bucket, pricing, weekday)) total += hourCost;
+  return total;
 }
 
 // ── time-of-use (peak / valley) pricing ──────────────────────────────────────
@@ -301,7 +361,7 @@ function multiplierFor(weekday, hour, tou) {
 
 // Persistent cache: raw token/request aggregates are stored per session. Prices
 // are intentionally not cached, so changing pricing can be applied immediately.
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const usageCachePath = () => join(dshHome(), "storages", "usage-cache.json");
 const sessionRecords = new Map();
 // days: Map<date, Map<"provider|model", bucket>>
@@ -310,7 +370,18 @@ const days = new Map();
 const cursors = new Map();
 
 function emptyBucket(provider, model) {
-  return { provider, model, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, requests: 0, estimatedCostUsd: 0, hourly: initHourly() };
+  return {
+    provider,
+    model,
+    input: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    output: 0,
+    requests: 0,
+    estimatedCostUsd: 0,
+    hourly: initHourly(),
+    usageRecords: [],
+  };
 }
 
 function addBucket(target, source) {
@@ -330,6 +401,18 @@ function addBucket(target, source) {
       to.cacheWrite += Number(from.cacheWrite) || 0;
       to.output += Number(from.output) || 0;
       to.requests += Number(from.requests) || 0;
+    }
+  }
+  // A missing per-request list denotes a v1 cache aggregate. Do not mix a
+  // partial list with unknown records, or the context-tier price would omit
+  // part of the bucket. Appending is looped, never spread: a single day bucket
+  // can hold hundreds of thousands of requests, and spread pushes would throw
+  // a RangeError long before that.
+  if (!Array.isArray(target.usageRecords) || !Array.isArray(source?.usageRecords)) {
+    target.usageRecords = null;
+  } else {
+    for (const usage of source.usageRecords) {
+      if (usage && typeof usage === "object") target.usageRecords.push(usage);
     }
   }
 }
@@ -380,7 +463,14 @@ function deserializeSession(record) {
 function loadUsageCache() {
   try {
     const raw = JSON.parse(readFileSync(usageCachePath(), "utf8"));
-    if (raw?.version !== CACHE_VERSION || !raw.sessions || typeof raw.sessions !== "object") return;
+    if (!raw.sessions || typeof raw.sessions !== "object") return;
+    // Migrate the v1 cache (pre-context-tier) instead of dropping it: its
+    // aggregates keep the history of session logs that were already deleted.
+    // Existing logs are re-folded into v2 rows right after, so pricing (and
+    // the context-tier rule) becomes exact for everything still on disk.
+    // Unknown future versions are left untouched.
+    const migrate = raw.version === 1;
+    if (raw.version !== CACHE_VERSION && !migrate) return;
     for (const [sessionId, source] of Object.entries(raw.sessions)) {
       const record = deserializeSession(source);
       if (!record) continue;
@@ -395,6 +485,9 @@ function loadUsageCache() {
       });
     }
     mergeSessionDays();
+    // Force every log still on disk to be re-read once: foldSession replaces
+    // its session record (and legacy buckets) with fresh v2 rows.
+    if (migrate) cursors.clear();
   } catch {
     // Missing or corrupt cache is safe: the normal log scan rebuilds it.
   }
@@ -567,6 +660,15 @@ function foldSession(file) {
         b.cacheWrite += cw;
         b.output += out;
         b.requests += 1;
+        if (Array.isArray(b.usageRecords)) {
+          b.usageRecords.push({
+            input: inp,
+            cacheRead: cr,
+            cacheWrite: cw,
+            output: out,
+            hour: localHour(ev.time),
+          });
+        }
         const hc = b.hourly[localHour(ev.time)];
         hc.input += inp;
         hc.cacheRead += cr;
@@ -646,12 +748,14 @@ function summarizeProviders(dayObj, pricing, weekday, includeHourly = false) {
     summary.cacheRead += b.cacheRead || 0;
     summary.cacheWrite += b.cacheWrite || 0;
 
-    if (includeHourly && Array.isArray(b.hourly)) {
+    if (includeHourly) {
+      const hourCosts = bucketHourlyCostsUsd(b, pricing, weekday);
       for (let hour = 0; hour < 24; hour++) {
-        const source = b.hourly[hour];
+        const source = b.hourly?.[hour];
         const target = summary.hourly[hour];
-        if (!source || !target) continue;
-        target.usd += hourlyCostUsd(b, hour, pricing, weekday);
+        if (!target) continue;
+        target.usd += hourCosts[hour];
+        if (!source) continue;
         target.requests += source.requests || 0;
         target.input += source.input || 0;
         target.cacheRead += source.cacheRead || 0;
@@ -715,20 +819,24 @@ function emit(pricing) {
       providers: summarizeProviders(m, pricing, weekdayFromDayKey(d)),
     };
   });
-  // Per-hour series for today (0–24), feeding the panel's 天 (day) view.
+  // Per-hour series for today (0–24), feeding the panel's 天 (day) view. Cost
+  // per bucket is a single pass over its records; only token stats are summed
+  // per hour afterwards.
+  const bucketCosts = [];
+  if (dayObj) {
+    for (const b of dayObj.values()) bucketCosts.push({ bucket: b, costs: bucketHourlyCostsUsd(b, pricing, weekday) });
+  }
   const hourly = Array.from({ length: 24 }, (_, h) => {
     let u = 0, r = 0, inp = 0, out = 0, cr = 0, cw = 0;
-    if (dayObj) {
-      for (const b of dayObj.values()) {
-        const hb = b.hourly?.[h];
-        if (!hb) continue;
-        inp += hb.input;
-        cr += hb.cacheRead;
-        cw += hb.cacheWrite;
-        out += hb.output;
-        r += hb.requests || 0;
-        u += hourlyCostUsd(b, h, pricing, weekday);
-      }
+    for (const { bucket: b, costs } of bucketCosts) {
+      u += costs[h];
+      const hb = b.hourly?.[h];
+      if (!hb) continue;
+      inp += hb.input;
+      cr += hb.cacheRead;
+      cw += hb.cacheWrite;
+      out += hb.output;
+      r += hb.requests || 0;
     }
     return { hour: h, usd: +u.toFixed(4), requests: r, input: inp, cacheRead: cr, cacheWrite: cw, output: out };
   });
