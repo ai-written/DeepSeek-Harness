@@ -427,7 +427,9 @@ function saveUsageCache() {
     mkdirSync(join(dshHome(), "storages"), { recursive: true });
     const sessions = {};
     for (const [sessionId, record] of sessionRecords) sessions[sessionId] = serializeSession(record);
-    temp = `${path}.tmp-${process.pid}`;
+    // Include time and entropy so a restarted sidecar never reuses a stale
+    // temporary filename whose handle may still be held by another process.
+    temp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     writeFileSync(temp, JSON.stringify({ version: CACHE_VERSION, sessions }));
     try {
       renameSync(temp, path);
@@ -455,6 +457,21 @@ function saveUsageCache() {
   }
 }
 
+const SESSION_LOG_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd)?$/;
+
+function sessionLogParent(file) {
+  const index = Math.max(file.lastIndexOf("\\"), file.lastIndexOf("/"));
+  return index >= 0 ? file.slice(0, index) : "";
+}
+
+function sessionLogRank(file) {
+  const index = Math.max(file.lastIndexOf("\\"), file.lastIndexOf("/"));
+  const name = index >= 0 ? file.slice(index + 1) : file;
+  const match = SESSION_LOG_RE.exec(name);
+  if (!match) return -1;
+  return (Number(match[1]) || 0) * 2 + (name.endsWith(".zstd") ? 1 : 0);
+}
+
 function logFiles(dir, out = []) {
   let entries;
   try {
@@ -465,7 +482,19 @@ function logFiles(dir, out = []) {
   for (const e of entries) {
     const p = join(dir, e.name);
     if (e.isDirectory()) logFiles(p, out);
-    else if (/^session\.jsonl(\.zstd)?$/.test(e.name)) out.push(p);
+    else if (SESSION_LOG_RE.test(e.name)) out.push(p);
+  }
+  // dsh may leave older artifacts beside a migrated session.vN log. They are
+  // generations of the same session, not separate sessions to add. Select the
+  // highest generation per session directory so future v3/v4/... files work.
+  if (dir === sessionsRoot()) {
+    const best = new Map();
+    for (const file of out) {
+      const parent = sessionLogParent(file);
+      const current = best.get(parent);
+      if (!current || sessionLogRank(file) > sessionLogRank(current)) best.set(parent, file);
+    }
+    return out.filter((file) => best.get(sessionLogParent(file)) === file);
   }
   return out;
 }

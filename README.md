@@ -83,7 +83,7 @@ npm run build
 
 主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日 / 近 12 个月用量图表（含金额、token、请求数、缓存命中率合计），可按会话日志中的 `provider` 字段筛选供应商，并编辑汇率与单价。
 
-- **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 zstd），按 `provider` / 模型分桶并每 3 秒增量刷新；统计缓存保存于 `~/.dsh/storages/usage-cache.json`，启动先读取缓存，只重算新增或变化的日志，删除日志时保留缓存中的历史统计；打开用量弹窗时暂停轮询，以弹窗打开瞬间的数据为准，关闭后立即恢复；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染
+- **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 `session.jsonl(.zstd)` 和 `session.vN.jsonl(.zstd)` 版本格式），按 `provider` / 模型分桶并每 3 秒增量刷新；统计缓存保存于 `~/.dsh/storages/usage-cache.json`，启动先读取缓存，只重算新增或变化的日志，删除日志时保留缓存中的历史统计；打开用量弹窗时暂停轮询，以弹窗打开瞬间的数据为准，关闭后立即恢复；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染
 - **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率与峰时时段计价；sidecar 每次刷新重读，改动即时生效
 - **计价单位**：`default.currency` 与各 override 行的 `currency` 可选 `"cny"`（人民币，缺省）或 `"usd"`（美元）；旧配置缺省该字段时按人民币计
 - **合计币种**：顶层 `totalCurrency` 可选 `"cny"`（缺省）或 `"usd"`，决定所有金额合计的币种；各行价格按计价单位换算到合计币种，**计价单位与合计币种一致时不经汇率**（全部按人民币计价时无需汇率换算）；徽标与图表始终以人民币显示
