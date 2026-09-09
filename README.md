@@ -12,7 +12,7 @@ Tauri v2 桌面壳，将 [DeepSeek Harness](https://github.com/deepseek-ai/deeps
 
 - Rust 工具链（≥ 1.77）
 - Node ≥ 22
-- 全局安装 dsh：`npm i -g @deepseek-ai/dsh`
+- 全局安装 dsh：`npm i -g @deepseek-ai/dsh`（需为支持 `--no-open` 的新版，过低版本无法启动）
 - WebView2 Runtime（Win11 自带，Win10 需安装）
 
 ```bash
@@ -29,7 +29,7 @@ npm run build    # 打包 release
 - **无控制台闪窗**：直接 spawn `node.exe`，不弹 cmd 窗口
 - **启动日志**：所有关键步骤与 dsh 的 stderr 写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP），"双击没反应"可从这里排查
 - **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）
-- **兼容新旧 dsh**：自动探测 `--no-open` 支持——新版 dsh 不弹系统浏览器；旧版自动回退（仅可能弹出浏览器，不影响使用）
+- **不弹系统浏览器**：以 `--no-open` 启动 dsh，界面只出现在窗口内；不再做 `--help` 特性探测，启动更快（要求全局 dsh 支持 `--no-open`）
 - **更新提示**：每次启动检查 GitHub 最新版本（走 HTML 页面重定向，不占用 GitHub API 配额、静默失败、可配置更新源），有新版顶部横幅提示下载；点击"忽略此版本"后该版本不再提示
 - **干净退出**：关闭窗口即杀掉 dsh 整棵进程树，无残留
 
@@ -77,7 +77,7 @@ npm run build
 
 > **免安装版首次运行**：浏览器下载的 exe 带"来自互联网"标记，SmartScreen 可能静默拦截双击。右键 exe → 属性 → 勾选**解除锁定**（或 `Unblock-File`）。彻底解决需代码签名。
 >
-> 目标机器需 Node ≥ 22 + 全局 `@deepseek-ai/dsh`；安装包本身**不含 dsh**。
+> 目标机器需 Node ≥ 22 + 全局 `@deepseek-ai/dsh`（支持 `--no-open` 的版本）；安装包本身**不含 dsh**。
 
 ## 每日用量徽标
 

@@ -161,41 +161,106 @@ fn emit_startup(
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// WebView2 data directory for dev builds: separate from the release app so a
-/// dev instance never shares cookies/localStorage/WebView2 process state with
-/// a running release instance (same bundle identifier → same default
-/// directory → cross-instance page bleed, e.g. the dev window loading the
-/// release window's page). Falls back to TEMP when %LOCALAPPDATA% is not
-/// writable (policy/sandbox) — a failed webview data dir is fatal, unlike a
-/// failed log.
-#[cfg(debug_assertions)]
+/// Number of recent per-launch release WebView2 stores to keep before pruning.
+#[cfg(not(debug_assertions))]
+const RELEASE_WEBVIEW_STORE_KEEP: usize = 4;
+
+/// WebView2 data directory for this launch.
+///
+/// Dev builds keep a stable `deepseek-harness-dev` store so a dev instance
+/// never shares WebView2 state with a running release instance. Release builds
+/// use a fresh, timestamped store per launch (see [`prepare_webview_data_dir`]):
+/// dsh serves a brand-new origin on every launch (the shell passes `--port 0`
+/// and dsh appends a fresh session token), so a persistent store has no
+/// cross-launch reuse value — it only ever accumulates stale HTTP-cache /
+/// storage entries from earlier dsh layouts. Such a stale entry can
+/// deterministically break a later launch's client-plugin bundle load (the
+/// "Failed to load plugins" / `client-modules: bundle script … failed to load`
+/// error) until the store is manually cleared; a fresh store per launch makes
+/// that stale state unable to survive into the next launch.
 fn webview_data_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base
-        .join("com.deepseekharness.desktop")
-        .join("deepseek-harness-dev");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        dir
+    let root = base.join("com.deepseekharness.desktop");
+    if cfg!(debug_assertions) {
+        root.join("deepseek-harness-dev")
     } else {
-        std::env::temp_dir().join("deepseek-harness-dev-webview")
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        root.join(format!("deepseek-harness-webview-{stamp}"))
     }
 }
 
-/// Whether the installed dsh web supports `--no-open`; feature-detected once
-/// per process by asking the web command's `--help` (see supports_no_open).
-static SUPPORTS_NO_OPEN: OnceLock<bool> = OnceLock::new();
+/// Prune per-launch release WebView2 stores from earlier launches, keeping the
+/// most recent [`RELEASE_WEBVIEW_STORE_KEEP`]. Older stores belong to
+/// already-exited launches; the current launch's own (newest) store is never
+/// touched.
+#[cfg(not(debug_assertions))]
+fn prune_release_webview_stores(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let mut stores: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("deepseek-harness-webview-"))
+        })
+        .collect();
+    // Names embed an ascending millisecond timestamp, so descending sort = newest first.
+    stores.sort_by(|a, b| b.cmp(a));
+    for old in stores.into_iter().skip(RELEASE_WEBVIEW_STORE_KEEP) {
+        match std::fs::remove_dir_all(&old) {
+            Ok(()) => log_line(&format!("pruned old WebView2 store -> {}", old.display())),
+            Err(e) => log_line(&format!(
+                "prune WebView2 store failed (will retry next launch): {} ({e})",
+                old.display()
+            )),
+        }
+    }
+}
+
+/// Ensure this launch's WebView2 data directory exists, falling back to TEMP
+/// when %LOCALAPPDATA% is not writable (a failed webview data dir is fatal,
+/// unlike a failed log).
+fn ensure_webview_data_dir(dir: std::path::PathBuf) -> std::path::PathBuf {
+    if std::fs::create_dir_all(&dir).is_ok() {
+        dir
+    } else {
+        let fallback = std::env::temp_dir().join(if cfg!(debug_assertions) {
+            "deepseek-harness-dev-webview"
+        } else {
+            "deepseek-harness-webview-fallback"
+        });
+        let _ = std::fs::create_dir_all(&fallback);
+        fallback
+    }
+}
+
+#[cfg(debug_assertions)]
+fn prepare_webview_data_dir() -> std::path::PathBuf {
+    ensure_webview_data_dir(webview_data_dir())
+}
+
+#[cfg(not(debug_assertions))]
+fn prepare_webview_data_dir() -> std::path::PathBuf {
+    let dir = webview_data_dir();
+    if let Some(parent) = dir.parent() {
+        prune_release_webview_stores(parent);
+    }
+    ensure_webview_data_dir(dir)
+}
 
 fn spawn_harness() -> std::io::Result<Child> {
-    // Newer dsh web versions open the default browser by default; the shell
-    // serves the UI in its own WebView instead. Only pass --no-open when the
-    // installed dsh understands it — older versions reject the unknown option
-    // and abort the boot (see supports_no_open).
-    let mut args = vec!["--profile", "web", "--port", "0"];
-    if supports_no_open() {
-        args.insert(2, "--no-open");
-    }
+    // dsh web opens the default browser by default; the shell serves the UI in
+    // its own WebView instead. --no-open is passed unconditionally: the shell
+    // documents a minimum dsh that understands the flag (an older dsh rejects
+    // the unknown option and aborts, which surfaces as a startup error).
+    let args = vec!["--profile", "web", "--no-open", "--port", "0"];
     #[cfg(target_os = "windows")]
     {
         // Locate dsh first (DSH_BIN override → dsh.cmd on PATH), then pick a
@@ -268,53 +333,6 @@ fn npm_install_dir(bin_js: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
-}
-
-/// Run `dsh --profile web --help` and return its stdout (None when the probe
-/// itself fails: dsh/node missing or a spawn error). The web app parses flags
-/// before binding anything, so this starts no server and needs no profile.
-fn dsh_help_output() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        let bin_js = locate_dsh_bin_js().ok()?;
-        let node = locate_node(npm_install_dir(&bin_js).as_deref()).ok()?;
-        let output = Command::new(node)
-            .arg(&bin_js)
-            .args(["--profile", "web", "--help"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        String::from_utf8(output.stdout).ok()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let output = Command::new("dsh")
-            .args(["--profile", "web", "--help"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        String::from_utf8(output.stdout).ok()
-    }
-}
-
-/// Whether the installed dsh web supports `--no-open` (detected once per
-/// process). Older dsh versions reject the flag as an unknown option and abort
-/// the boot, so the shell only passes it when the help text lists it. When the
-/// probe cannot run, defaults to false: an older dsh keeps its old behavior,
-/// and a newer one may open the browser — cosmetic, not fatal.
-fn supports_no_open() -> bool {
-    *SUPPORTS_NO_OPEN.get_or_init(|| {
-        let supported = dsh_help_output()
-            .map(|help| help.contains("--no-open"))
-            .unwrap_or(false);
-        log_line(&format!("dsh web supports --no-open: {supported}"));
-        supported
-    })
 }
 
 /// Find `node.exe` to run dsh with. Prefers a node.exe next to the npm global
@@ -1543,13 +1561,14 @@ fn main() {
                             }
                         }
                     });
-            // Dev builds get their own WebView2 data directory (see
-            // webview_data_dir) so a dev instance never bleeds into a running
-            // release instance's WebView state. The cfg'd `let` shadows the
-            // builder only in debug builds, so release builds never reassign
-            // it and rustc doesn't warn about an unused `mut`.
-            #[cfg(debug_assertions)]
-            let window_builder = window_builder.data_directory(webview_data_dir());
+            // Give the WebView a dedicated data directory in both dev and
+            // release builds (see prepare_webview_data_dir): dev keeps its own
+            // stable store so a dev instance never bleeds into a running
+            // release instance's WebView state, and release starts every launch
+            // from a fresh, timestamped store so stale WebView2 state from an
+            // earlier dsh layout can never break the /plugins client-bundle
+            // load again.
+            let window_builder = window_builder.data_directory(prepare_webview_data_dir());
             let _window = window_builder.build().expect("failed to build main window");
 
             if close_test {

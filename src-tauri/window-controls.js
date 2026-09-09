@@ -71,15 +71,29 @@
     'background:transparent;'
 
   // Nudge the harness UI's own top-right header utilities (the "Session log"
-  // button container, generated class like wSkVaW_headerUtilities) down so it
-  // clears the caption buttons pinned above it. Matched by class-name
-  // substring because the leading hash of the generated class can change
-  // between harness builds; !important wins over the late-loading page CSS
-  // (this script runs before the page's own stylesheets).
+  // button container, generated class like wSkVaW_headerUtilities), the
+  // header corner (the right-sidebar expand control, whose host container
+  // carries the stable [data-conversation-header-corner]) AND the sidebar's
+  // top tab strip (generated class like _tabStrip_1wfn9_92) down so all
+  // clear the caption buttons pinned above them. The utilities and the tab
+  // strip are matched by class-name substring because the leading hash of
+  // the generated class can change between harness builds; the corner is
+  // matched by its stable data attribute. !important wins over the
+  // late-loading page CSS (this script runs before the page's own
+  // stylesheets).
+  //
+  // The tab strip is nudged with a top MARGIN rather than the relative shift
+  // used for the header utilities: it is the first child of a fixed-height
+  // flex column whose next sibling (_paneBody) is position:relative and
+  // painted after it, so a visual-only shift (position:relative; top) would
+  // make the strip's bottom overlap the pane body and leave the lower part
+  // of the strip's buttons covered and unclickable. A margin moves the strip
+  // AND the pane body after it down in flow, so nothing overlaps.
   nudgeStyle = document.createElement('style')
   nudgeStyle.id = 'deepseek-harness-header-nudge'
   nudgeStyle.textContent =
-    '[class*="headerUtilities"]{position:relative !important;top:18px !important;}'
+    '[class*="headerUtilities"],[data-conversation-header-corner]{position:relative !important;top:18px !important;}' +
+    '[class*="tabStrip"]{margin-top:18px !important;}'
   // Drag region: left part of the bar (buttons stay interactive on the right).
   const drag = document.createElement('div')
   drag.style.cssText =
