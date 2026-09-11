@@ -181,6 +181,52 @@
   }
   } // end: custom titlebar (skipped under native decorations)
 
+  // ── WebView2 store self-healing ──────────────────────────────────────────
+  // A stale/corrupt WebView2 user-data store can make this page fail to load
+  // the harness's client-plugin bundles ("Failed to load plugins" /
+  // `client-modules: bundle script … failed to load`), and it then stays broken
+  // on every reload and every launch. The store cannot be cleared in place (the
+  // bad state also lives in the running WebView2 process, and its files are in
+  // use), so report the failure to the Rust side, which records a reset for the
+  // next launch and relaunches the app once.
+  //
+  // Detection keys on the failure MECHANISM, not on error text: a <script>
+  // whose /plugins bundle failed to load (resource load errors do not bubble,
+  // hence the capture phase), plus dsh's own `client-modules:` prefix on an
+  // unhandled rejection as a second signal.
+  let webviewBrokenReported = false
+  function reportWebviewBroken(source, detail) {
+    if (webviewBrokenReported) return
+    webviewBrokenReported = true
+    if (!Tauri.event || !Tauri.event.emit) return
+    console.warn('[deepseek-harness] reporting broken webview:', source, detail)
+    Tauri.event
+      .emit('dsh-webview-broken', { source, detail: String(detail).slice(0, 2000) })
+      .catch(() => {})
+  }
+  window.addEventListener(
+    'error',
+    (e) => {
+      const target = e.target
+      if (
+        target &&
+        target.tagName === 'SCRIPT' &&
+        typeof target.src === 'string' &&
+        target.src.indexOf('/plugins/') !== -1
+      ) {
+        reportWebviewBroken('script', target.src)
+      }
+    },
+    true
+  )
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e.reason
+    const message = (reason && (reason.message || String(reason))) || ''
+    if (message.indexOf('client-modules:') !== -1 || message.indexOf('Failed to load plugins') !== -1) {
+      reportWebviewBroken('rejection', message)
+    }
+  })
+
   // Forward Rust-side startup progress to the placeholder page
   // (#dsh-startup-status and the step indicator in #startup-steps). No-op on
   // the harness page (no such elements). Errors are styled red and the window

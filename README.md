@@ -32,6 +32,7 @@ npm run build    # 打包 release
 - **不弹系统浏览器**：以 `--no-open` 启动 dsh，界面只出现在窗口内；不再做 `--help` 特性探测，启动更快（要求全局 dsh 支持 `--no-open`）
 - **更新提示**：每次启动检查 GitHub 最新版本（走 HTML 页面重定向，不占用 GitHub API 配额、静默失败、可配置更新源），有新版顶部横幅提示下载；点击"忽略此版本"后该版本不再提示
 - **干净退出**：关闭窗口即杀掉 dsh 整棵进程树，无残留
+- **界面自愈**：release 与 dev 各自使用固定的 WebView2 缓存目录（release 为 `%LOCALAPPDATA%\com.deepseekharness.desktop\deepseek-harness-webview`）；若某次启动页面报出「Failed to load plugins」（客户端插件 bundle 加载失败），会自动清掉该目录并重启一次，而不是一直坏下去。带护栏：同一问题 10 分钟内最多自动重启 2 次，超出则保留报错不再重启；dev 构建只安排清理、不自动重启（避免与 cargo watcher 抢生命周期）。手动兜底：删掉那个目录再打开同样有效
 
 ## 开发注意
 

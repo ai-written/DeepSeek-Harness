@@ -161,73 +161,196 @@ fn emit_startup(
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Number of recent per-launch release WebView2 stores to keep before pruning.
-#[cfg(not(debug_assertions))]
-const RELEASE_WEBVIEW_STORE_KEEP: usize = 4;
+/// Auto-reset loop guard: how many consecutive store resets the recovery path
+/// may perform before it gives up and leaves the error visible.
+const MAX_AUTO_RESETS: u32 = 2;
+/// A store reset older than this many seconds no longer counts against the loop
+/// guard, so a fresh failure much later starts with a new reset budget.
+const RESET_WINDOW_SECS: u64 = 600;
 
-/// WebView2 data directory for this launch.
+/// WebView2 data directory for this build family.
 ///
-/// Dev builds keep a stable `deepseek-harness-dev` store so a dev instance
-/// never shares WebView2 state with a running release instance. Release builds
-/// use a fresh, timestamped store per launch (see [`prepare_webview_data_dir`]):
-/// dsh serves a brand-new origin on every launch (the shell passes `--port 0`
-/// and dsh appends a fresh session token), so a persistent store has no
-/// cross-launch reuse value — it only ever accumulates stale HTTP-cache /
-/// storage entries from earlier dsh layouts. Such a stale entry can
-/// deterministically break a later launch's client-plugin bundle load (the
-/// "Failed to load plugins" / `client-modules: bundle script … failed to load`
-/// error) until the store is manually cleared; a fresh store per launch makes
-/// that stale state unable to survive into the next launch.
+/// Dev builds get their own stable store so a dev instance never shares
+/// WebView2 state with a running release instance. Release builds use one
+/// stable store as well: dsh serves a brand-new origin on every launch (the
+/// shell passes `--port 0` and dsh appends a fresh session token), so nothing in
+/// the store is reused across launches — but keeping it means WebView2 does not
+/// re-initialize its whole profile (and its component caches) on every launch.
+/// A store that does go bad — stale state that makes the harness page fail to
+/// load its client-plugin bundles — is cleared on demand by the recovery path
+/// (see [`request_webview_reset`]) instead of on every launch.
 fn webview_data_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let root = base.join("com.deepseekharness.desktop");
-    if cfg!(debug_assertions) {
-        root.join("deepseek-harness-dev")
+    root.join(if cfg!(debug_assertions) {
+        "deepseek-harness-dev"
     } else {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        root.join(format!("deepseek-harness-webview-{stamp}"))
+        "deepseek-harness-webview"
+    })
+}
+
+/// Recovery bookkeeping shared across launches (see [`request_webview_reset`]).
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct WebviewRecovery {
+    /// A reset was requested and has not run yet: the next launch clears the
+    /// WebView2 store before creating the window.
+    #[serde(default, rename = "pendingReset")]
+    pending_reset: bool,
+    /// Auto-resets already performed inside the current loop-guard window.
+    #[serde(default)]
+    attempts: u32,
+    /// Unix seconds of the last auto-reset, for the loop-guard window.
+    #[serde(default, rename = "lastReset")]
+    last_reset: u64,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Path of the recovery bookkeeping file, next to the startup log.
+fn webview_recovery_path() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("deepseek-harness").join("webview-recovery.json")
+}
+
+fn read_webview_recovery() -> WebviewRecovery {
+    std::fs::read_to_string(webview_recovery_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_webview_recovery(state: &WebviewRecovery) -> std::io::Result<()> {
+    let path = webview_recovery_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".into());
+    std::fs::write(path, json)
+}
+
+/// Remove the legacy per-launch stores an earlier build created
+/// (`deepseek-harness-webview-<millis>`), best-effort: the fixed store replaced
+/// them, so they are dead weight (tens of MB each). The fixed store's own name
+/// has no trailing dash and so never matches.
+fn cleanup_legacy_webview_stores(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let legacy = path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("deepseek-harness-webview-"));
+        if !legacy {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => log_line(&format!("removed legacy per-launch WebView2 store -> {}", path.display())),
+            Err(e) => log_line(&format!("could not remove legacy WebView2 store {} ({e})", path.display())),
+        }
     }
 }
 
-/// Prune per-launch release WebView2 stores from earlier launches, keeping the
-/// most recent [`RELEASE_WEBVIEW_STORE_KEEP`]. Older stores belong to
-/// already-exited launches; the current launch's own (newest) store is never
-/// touched.
-#[cfg(not(debug_assertions))]
-fn prune_release_webview_stores(root: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(root) else { return };
-    let mut stores: Vec<std::path::PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("deepseek-harness-webview-"))
-        })
-        .collect();
-    // Names embed an ascending millisecond timestamp, so descending sort = newest first.
-    stores.sort_by(|a, b| b.cmp(a));
-    for old in stores.into_iter().skip(RELEASE_WEBVIEW_STORE_KEEP) {
-        match std::fs::remove_dir_all(&old) {
-            Ok(()) => log_line(&format!("pruned old WebView2 store -> {}", old.display())),
-            Err(e) => log_line(&format!(
-                "prune WebView2 store failed (will retry next launch): {} ({e})",
-                old.display()
-            )),
+/// Delete the WebView2 store directory, retrying: the relaunch starts while the
+/// previous instance's WebView2 processes may still be releasing these files,
+/// so the first attempts can hit a lock. Best-effort — if it never succeeds the
+/// relaunch still proceeds (the window may just stay broken, and the loop guard
+/// keeps that from repeating forever).
+fn clear_webview_store(dir: &std::path::Path) {
+    const ATTEMPTS: u32 = 8;
+    for attempt in 1..=ATTEMPTS {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                log_line(&format!("webview recovery: cleared store -> {}", dir.display()));
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log_line(&format!("webview recovery: store already absent -> {}", dir.display()));
+                return;
+            }
+            Err(e) => {
+                if attempt == ATTEMPTS {
+                    log_line(&format!(
+                        "webview recovery: could not clear {} after {ATTEMPTS} attempts ({e})",
+                        dir.display()
+                    ));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+/// Decide whether a detected webview failure should trigger the clear-and-
+/// rebuild path, and record it for the next launch. Returns true when the
+/// caller should relaunch the app. Bounded by [`MAX_AUTO_RESETS`] per
+/// [`RESET_WINDOW_SECS`], so a failure the store cannot explain (an actually
+/// incompatible dsh build) cannot turn into a restart loop.
+fn request_webview_reset(signal: &str) -> bool {
+    let mut state = read_webview_recovery();
+    let now = unix_now();
+    if now.saturating_sub(state.last_reset) > RESET_WINDOW_SECS {
+        state.attempts = 0;
+    }
+    if state.attempts >= MAX_AUTO_RESETS {
+        log_line(&format!(
+            "webview recovery: giving up after {} resets within {RESET_WINDOW_SECS}s (signal: {signal}); \
+             the WebView2 store does not explain this failure — delete it manually if the UI stays broken: {}",
+            state.attempts,
+            webview_data_dir().display()
+        ));
+        return false;
+    }
+    state.attempts += 1;
+    state.last_reset = now;
+    state.pending_reset = true;
+    match write_webview_recovery(&state) {
+        Ok(()) => {
+            log_line(&format!(
+                "webview recovery: reset #{} scheduled (signal: {signal})",
+                state.attempts
+            ));
+            true
+        }
+        Err(e) => {
+            log_line(&format!("webview recovery: could not record the reset request: {e}"));
+            false
         }
     }
 }
 
 /// Ensure this launch's WebView2 data directory exists, falling back to TEMP
 /// when %LOCALAPPDATA% is not writable (a failed webview data dir is fatal,
-/// unlike a failed log).
-fn ensure_webview_data_dir(dir: std::path::PathBuf) -> std::path::PathBuf {
+/// unlike a failed log). A reset requested by [`request_webview_reset`] is
+/// carried out here: before the window is created, i.e. before WebView2
+/// initializes its environment on this directory.
+fn prepare_webview_data_dir() -> std::path::PathBuf {
+    let dir = webview_data_dir();
+    if let Some(root) = dir.parent() {
+        cleanup_legacy_webview_stores(root);
+    }
+    let mut state = read_webview_recovery();
+    if state.pending_reset {
+        log_line(&format!(
+            "webview recovery: clearing the store before startup -> {}",
+            dir.display()
+        ));
+        clear_webview_store(&dir);
+        state.pending_reset = false;
+        if let Err(e) = write_webview_recovery(&state) {
+            log_line(&format!("webview recovery: could not clear the pending flag: {e}"));
+        }
+    }
     if std::fs::create_dir_all(&dir).is_ok() {
         dir
     } else {
@@ -239,20 +362,6 @@ fn ensure_webview_data_dir(dir: std::path::PathBuf) -> std::path::PathBuf {
         let _ = std::fs::create_dir_all(&fallback);
         fallback
     }
-}
-
-#[cfg(debug_assertions)]
-fn prepare_webview_data_dir() -> std::path::PathBuf {
-    ensure_webview_data_dir(webview_data_dir())
-}
-
-#[cfg(not(debug_assertions))]
-fn prepare_webview_data_dir() -> std::path::PathBuf {
-    let dir = webview_data_dir();
-    if let Some(parent) = dir.parent() {
-        prune_release_webview_stores(parent);
-    }
-    ensure_webview_data_dir(dir)
 }
 
 fn spawn_harness() -> std::io::Result<Child> {
@@ -1505,6 +1614,89 @@ fn main() {
                 });
             }
 
+            // WebView2 store self-healing. A stale/corrupt WebView2 user-data
+            // store can make the harness page fail to load its client-plugin
+            // bundles ("Failed to load plugins" / `client-modules: bundle
+            // script … failed to load`), and it stays broken on every launch
+            // and on every reload. The poisoned state also lives in the running
+            // WebView2 process and the files are in use, so it cannot be cleared
+            // in place: the injected detector (window-controls.js) reports the
+            // failure here, this records a reset for the next launch and
+            // relaunches the app once (release builds only — see below), instead
+            // of leaving a permanently broken window. Bounded by MAX_AUTO_RESETS
+            // so a non-store failure cannot loop.
+            {
+                let broken_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let _broken_app = app.handle().clone();
+                app.handle().listen("dsh-webview-broken", move |event| {
+                    let signal = event.payload().to_string();
+                    log_line(&format!("webview broken signal: {signal}"));
+                    // One recovery per launch: the page can report several
+                    // symptoms of the same broken boot.
+                    if broken_seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    if !request_webview_reset(&signal) {
+                        return;
+                    }
+                    // Relaunching is a product feature for installed builds.
+                    // Under `tauri dev` the cargo watcher owns the app lifecycle,
+                    // so relaunching here could race it into two instances (and
+                    // two dsh trees on one DSH_HOME — the corruption case the
+                    // README warns about). Debug builds therefore only schedule
+                    // the reset: the next dev start clears the store.
+                    #[cfg(debug_assertions)]
+                    {
+                        log_line("webview recovery: debug build — reset scheduled, not relaunching");
+                        return;
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        let app = _broken_app.clone();
+                        std::thread::spawn(move || {
+                            // Let the log line land and the page settle before the
+                            // window disappears.
+                            std::thread::sleep(std::time::Duration::from_millis(1200));
+                            let state = app.state::<Arc<HarnessState>>();
+                            let pid = *state.pid.lock().unwrap();
+                            log_line(&format!("webview recovery: killing harness pid={pid:?}"));
+                            kill_tree(pid);
+                            let usage_state = app.state::<Arc<UsageState>>();
+                            let usage_pid = *usage_state.pid.lock().unwrap();
+                            kill_tree(usage_pid);
+                            let exe = match std::env::current_exe() {
+                                Ok(exe) => exe,
+                                Err(e) => {
+                                    log_line(&format!("webview recovery: current_exe failed: {e}"));
+                                    return;
+                                }
+                            };
+                            // A fresh process is what actually gives WebView2 a new
+                            // environment on the (now cleared) store; a reload in
+                            // this process would not.
+                            match std::process::Command::new(&exe)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .spawn()
+                            {
+                                Ok(child) => log_line(&format!(
+                                    "webview recovery: relaunched {} pid={}",
+                                    exe.display(),
+                                    child.id()
+                                )),
+                                Err(e) => {
+                                    log_line(&format!("webview recovery: relaunch failed: {e}"));
+                                    return;
+                                }
+                            }
+                            log_line("webview recovery: exiting so the new instance starts clean");
+                            std::process::exit(0);
+                        });
+                    }
+                });
+            }
+
             // Create the main window in code so the custom titlebar controls
             // can be injected as an initialization script (runs on the
             // placeholder page AND after navigate to the harness URL).
@@ -1564,10 +1756,9 @@ fn main() {
             // Give the WebView a dedicated data directory in both dev and
             // release builds (see prepare_webview_data_dir): dev keeps its own
             // stable store so a dev instance never bleeds into a running
-            // release instance's WebView state, and release starts every launch
-            // from a fresh, timestamped store so stale WebView2 state from an
-            // earlier dsh layout can never break the /plugins client-bundle
-            // load again.
+            // release instance's WebView state, and release keeps one stable
+            // store too — a bad store is cleared on demand by the recovery path
+            // rather than on every launch, so normal startups pay nothing.
             let window_builder = window_builder.data_directory(prepare_webview_data_dir());
             let _window = window_builder.build().expect("failed to build main window");
 
