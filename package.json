@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "private": true,
   "description": "DeepSeek-Harness — Tauri desktop shell embedding the DeepSeek Harness web UI",
   "scripts": {

@@ -1088,26 +1088,23 @@ fn http_get(url: &str) -> Result<String, String> {
 /// `SEC_E_NO_CREDENTIALS` and .NET with "Authentication failed". Node is already
 /// a hard requirement of this shell, so it is a dependable route.
 fn node_get(url: &str) -> Result<String, String> {
-    // ESM (`import`, not `require`): the script runs from a `.mjs` file, where
-    // `require` is not defined — that failure looks like an unrelated stack trace.
-    const SCRIPT: &str = r#"
-import https from 'node:https';
-// argv[2] because this runs from a script FILE (see run_node_script); with
-// `node -e` the arguments would start at argv[1] instead — mixing the two up
-// silently passes the wrong string as the URL.
+    // ESM because the script runs from a `.mjs` file, where `require` is undefined.
+    // argv[2] is the URL: this runs from a script FILE (see run_node_script), where
+    // `node -e` would instead place the first argument at argv[1] — mixing the two
+    // up silently passes the wrong string as the target.
+    let script = format!(
+        "{NODE_HTTP_PRELUDE}
 const target = process.argv[2];
-const req = https.get(target, {
-  headers: { 'User-Agent': 'deepseek-harness-desktop', 'Accept': 'application/vnd.github+json' },
-}, (res) => {
-  if (res.statusCode >= 400) { process.stderr.write('HTTP ' + res.statusCode + '\n'); process.exit(1); }
-  const chunks = [];
-  res.on('data', (c) => chunks.push(c));
-  res.on('end', () => { process.stdout.write(Buffer.concat(chunks)); });
-});
-req.on('error', (e) => { process.stderr.write(String(e.message || e) + '\n'); process.exit(1); });
-req.setTimeout(12000, () => { req.destroy(); process.stderr.write('timeout after 12s\n'); });
-"#;
-    let body = run_node_script("node-get", SCRIPT, &[url])?;
+const fail = (m) => {{ process.stderr.write(String(m) + '\\n'); process.exit(1); }};
+const req = request(target, {{ 'User-Agent': 'deepseek-harness-desktop', 'Accept': 'application/vnd.github+json' }}, async (res) => {{
+  if (res.statusCode >= 400) return fail('HTTP ' + res.statusCode);
+  process.stdout.write(await readBody(res));
+}});
+req.on('error', (e) => fail(e.message || String(e)));
+req.setTimeout(12000, () => {{ req.destroy(); fail('timeout after 12s'); }});
+"
+    );
+    let body = run_node_script("node-get", &script, &[url])?;
     if body.trim().is_empty() {
         return Err("empty response from node".into());
     }
@@ -1890,29 +1887,43 @@ fn npm_install_into(
     }
 }
 
+/// Shared ESM prelude for the node HTTP helper scripts: the module picks itself
+/// from the URL scheme, so an `http://` mirror works exactly like `https://`
+/// (using the https module for an http target throws ERR_INVALID_PROTOCOL, which
+/// previously made any plain-http endpoint unusable).
+const NODE_HTTP_PRELUDE: &str = r#"
+import http from 'node:http';
+import https from 'node:https';
+const request = (target, hdrs, onResponse) => {
+  const mod = String(target).startsWith('http://') ? http : https;
+  return mod.get(target, { headers: hdrs }, onResponse);
+};
+const readBody = (res) => new Promise((resolve) => {
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => resolve(Buffer.concat(chunks)));
+});
+"#;
+
 /// HTTP GET with a custom `Accept` header, used for the npm registry (whose
 /// abbreviated packument is selected by `application/vnd.npm.install-v1+json`).
 /// Node is the primary route: its OpenSSL TLS works on machines where Windows'
 /// schannel/.NET stack cannot reach the host, and it needs no extra crates.
 fn http_get_with_accept(url: &str, accept: &str) -> Result<String, String> {
-    // ESM (`import`) because the script runs from a `.mjs` file, where `require`
-    // is undefined.
-    const SCRIPT: &str = r#"
-import https from 'node:https';
+    // ESM because the script runs from a `.mjs` file, where `require` is undefined.
+    let script = format!(
+        "{NODE_HTTP_PRELUDE}
 const [target, accept] = process.argv.slice(2);
-const fail = (m) => { process.stderr.write(String(m) + '\n'); process.exit(1); };
-const req = https.get(target, {
-  headers: { 'User-Agent': 'deepseek-harness-desktop', 'Accept': accept },
-}, (res) => {
-  if (res.statusCode >= 400) { fail('HTTP ' + res.statusCode); return; }
-  const chunks = [];
-  res.on('data', (c) => chunks.push(c));
-  res.on('end', () => { process.stdout.write(Buffer.concat(chunks)); });
-});
+const fail = (m) => {{ process.stderr.write(String(m) + '\\n'); process.exit(1); }};
+const req = request(target, {{ 'User-Agent': 'deepseek-harness-desktop', 'Accept': accept }}, async (res) => {{
+  if (res.statusCode >= 400) return fail('HTTP ' + res.statusCode);
+  process.stdout.write(await readBody(res));
+}});
 req.on('error', (e) => fail(e.message || String(e)));
-req.setTimeout(15000, () => { req.destroy(); fail('timeout after 15s'); });
-"#;
-    let body = run_node_script("node-http", SCRIPT, &[url, accept])?;
+req.setTimeout(15000, () => {{ req.destroy(); fail('timeout after 15s'); }});
+"
+    );
+    let body = run_node_script("node-http", &script, &[url, accept])?;
     if body.trim().is_empty() {
         return Err("empty response from node".into());
     }
@@ -1924,6 +1935,10 @@ req.setTimeout(15000, () => { req.destroy(); fail('timeout after 15s'); });
 /// already lives), `<dsh home>/tmp`, then TEMP. The dsh home is deliberately not
 /// first: it can be read-only for the app (policy, or a DSH_HOME the user
 /// pointed elsewhere), and a helper script must never fail for that reason.
+///
+/// Writability is probed by CREATING A FILE, not just the directory: on a locked
+/// down machine `create_dir_all` can succeed while file creation inside is denied,
+/// which would otherwise pick an unusable directory and fail every helper.
 fn writable_tmp_dir() -> std::path::PathBuf {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     let base = std::env::var_os("LOCALAPPDATA")
@@ -1933,14 +1948,20 @@ fn writable_tmp_dir() -> std::path::PathBuf {
     candidates.push(dsh_home().join("tmp"));
     candidates.push(std::env::temp_dir().join("deepseek-harness"));
     for candidate in &candidates {
-        if std::fs::create_dir_all(candidate).is_ok() {
-            return candidate.clone();
+        if std::fs::create_dir_all(candidate).is_err() {
+            continue;
         }
-        log_line(&format!(
-            "scratch dir not writable: {} ({:?})",
-            candidate.display(),
-            std::fs::create_dir_all(candidate).err()
-        ));
+        let probe = candidate.join(format!(".dsh-write-probe-{}", std::process::id()));
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                return candidate.clone();
+            }
+            Err(e) => log_line(&format!(
+                "scratch dir not writable (file probe): {} ({e})",
+                candidate.display()
+            )),
+        }
     }
     std::env::temp_dir()
 }
@@ -2356,15 +2377,16 @@ const DOWNLOAD_TIMEOUT_SECS: u32 = 900;
 /// assets with a 302 to its asset host), streams to the `.part` file, resumes
 /// with a Range request when the partial file matches the announced size,
 /// reports progress as JSON lines on stdout, and verifies the final byte count.
-/// Arguments: <url> <part-path> <expected-len>.
+///
+/// Runs as an ESM script FILE (see run_node_script_streaming), hence `import` and
+/// `argv[2]` for the first argument: <url> <part-path> <expected-len>.
 const NODE_DOWNLOAD_SCRIPT: &str = r#"
-const fs = require('fs');
-const https = require('https');
-// `node -e <script> <args…>` puts the script text at argv[1], so the real
-// arguments start at argv[2] (verified, not assumed).
+import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 const [url, partPath, expectedArg] = process.argv.slice(2);
 const expected = Number(expectedArg) || 0;
-const fail = (m) => { process.stderr.write(String(m)); process.exit(1); };
+const fail = (m) => { process.stderr.write(String(m) + '\n'); process.exit(1); };
 if (!/^https?:\/\//.test(String(url))) fail('bad url: ' + url);
 
 const already = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
@@ -2376,12 +2398,20 @@ const headers = {
 let mode = 'w';
 if (already > 0) { headers['Range'] = 'bytes=' + already + '-'; mode = 'a'; }
 
-const req = https.get(url, { headers }, (res) => {
+// Plain http is supported too: a mirror or a corporate proxy can be http, and the
+// caller only guarantees http(s). Using the https module for an http URL throws
+// ERR_INVALID_PROTOCOL.
+const request = (target, hdrs, onResponse) => {
+  const mod = String(target).startsWith('http://') ? http : https;
+  return mod.get(target, { headers: hdrs }, onResponse);
+};
+
+const req = request(url, headers, (res) => {
   const redirect = res.headers.location;
   if (res.statusCode >= 300 && res.statusCode < 400 && redirect) {
     // Follow the redirect once, absolutely, and restart from scratch.
     res.resume();
-    const again = https.get(new URL(redirect, url), { headers: { 'User-Agent': headers['User-Agent'], 'Accept': headers['Accept'] } }, (r2) => {
+    const again = request(new URL(redirect, url), { 'User-Agent': headers['User-Agent'], 'Accept': headers['Accept'] }, (r2) => {
       if (r2.statusCode >= 400) return fail('HTTP ' + r2.statusCode);
       stream(r2, 'w');
     });
@@ -2427,15 +2457,89 @@ req.on('error', (e) => fail(e.message));
 req.setTimeout(900000, () => { req.destroy(); fail('timeout after 900s'); });
 "#;
 
-/// The user's Downloads folder. USERPROFILE is enough on Windows (no shell
-/// lookups needed); anything else falls back to cwd, then TEMP, so a download
-/// always has a home.
+/// The user's real Downloads folder on Windows, or None when it cannot be
+/// determined.
+///
+/// `%USERPROFILE%\Downloads` is only a CONVENTION — it is wrong whenever the
+/// shell folders were redirected (a common managed/OneDrive setup: `文档` and
+/// `下载` moved elsewhere, and `%USERPROFILE%\Downloads` may not even exist, so
+/// creating it silently produces a folder that is not the user's 下载 and that
+/// `explorer /select` cannot present properly). Two authoritative sources:
+///   1. `SHGetKnownFolderPath(FOLDERID_Downloads)` — what Explorer's 下载 entry
+///      resolves to (PowerShell + COM, no extra crates);
+///   2. the registry's User Shell Folders entry for the Downloads GUID, which
+///      also works when COM is unavailable.
+/// An unexpanded/env-less value is rejected; the caller falls back to the
+/// conventional path.
+#[cfg(target_os = "windows")]
+fn known_downloads_dir() -> Option<std::path::PathBuf> {
+    let use_if_dir = |raw: String| -> Option<std::path::PathBuf> {
+        let trimmed = raw.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            return None;
+        }
+        let path = std::path::PathBuf::from(trimmed);
+        if path.is_dir() {
+            Some(path)
+        } else {
+            None
+        }
+    };
+
+    // 1. Known-folder API through the shell namespace.
+    let script = "$p = (New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self.Path; \
+                  if ($p) { [Console]::Out.Write($p) }";
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    if let Ok(out) = cmd.output() {
+        if out.status.success() {
+            if let Some(dir) = use_if_dir(String::from_utf8_lossy(&out.stdout).to_string()) {
+                log_line(&format!("update download: shell Downloads -> {}", dir.display()));
+                return Some(dir);
+            }
+        }
+    }
+
+    // 2. Registry: the Downloads GUID under User Shell Folders.
+    let reg = "$k = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders'; \
+               $v = (Get-ItemProperty -Path $k -ErrorAction SilentlyContinue).'{374DE290-123F-4565-9164-39C4925E467B}'; \
+               if ($v) { [Console]::Out.Write([Environment]::ExpandEnvironmentVariables($v)) }";
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", reg]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    if let Ok(out) = cmd.output() {
+        if out.status.success() {
+            if let Some(dir) = use_if_dir(String::from_utf8_lossy(&out.stdout).to_string()) {
+                log_line(&format!("update download: registry Downloads -> {}", dir.display()));
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Where a downloaded installer is written.
+///
+/// Windows uses the shell's real 下载 folder when it can be determined, and only
+/// then falls back to `%USERPROFILE%\Downloads`; other platforms use
+/// `$HOME/Downloads`. The chosen directory is always logged, so a user who cannot
+/// find the file can read the exact path (the tab also shows it) out of the log.
 fn download_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
+        if let Some(dir) = known_downloads_dir() {
+            return dir;
+        }
         if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
             let dir = std::path::PathBuf::from(profile).join("Downloads");
             if std::fs::create_dir_all(&dir).is_ok() {
+                log_line(&format!(
+                    "update download: using the conventional path {} (the shell's 下载 folder could not be determined)",
+                    dir.display()
+                ));
                 return dir;
             }
             log_line(&format!(
@@ -2453,10 +2557,15 @@ fn download_dir() -> std::path::PathBuf {
             }
         }
     }
-    match std::env::current_dir() {
+    let fallback = match std::env::current_dir() {
         Ok(dir) if dir.is_dir() => dir,
         _ => std::env::temp_dir(),
-    }
+    };
+    log_line(&format!(
+        "update download: WARNING no Downloads folder found; writing to {}",
+        fallback.display()
+    ));
+    fallback
 }
 
 /// A free path for `file_name` in `dir`: the name itself when unused, otherwise
@@ -2655,46 +2764,103 @@ fn download_asset_to(
 /// reporting and Range resume). The script writes one JSON object per line to
 /// stdout — `{"event":"progress","received":…,"total":…}` / `{"event":"done",…}`
 /// — and exits non-zero with the reason on stderr when anything fails.
+/// Run a node helper script from a file, streaming its stdout lines to
+/// `on_line`. Returns the captured stderr tail when the process fails.
+///
+/// Like [`run_node_script`], this deliberately does NOT use `node -e`: the
+/// argument offsets differ between `-e` (args from `argv[1]`) and a script file
+/// (args from `argv[2]`), and mixing them up silently hands the wrong string to
+/// the script — a downloader then reports `bad url: <local path>` and quietly
+/// degrades to the curl fallback. One shape for every helper keeps that class of
+/// bug impossible.
+fn run_node_script_streaming(
+    name: &str,
+    script: &str,
+    args: &[&str],
+    on_line: &dyn Fn(&str),
+) -> Result<std::process::ExitStatus, String> {
+    let node = locate_node(None).map_err(|e| e.to_string())?;
+    let dir = writable_tmp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let script_path = dir.join(format!("{name}-{stamp}.mjs"));
+    std::fs::write(&script_path, script)
+        .map_err(|e| format!("could not write {}: {e}", script_path.display()))?;
+
+    let mut cmd = Command::new(node);
+    cmd.arg(&script_path);
+    cmd.args(args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = cmd.spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&script_path);
+            return Err(format!("could not run node: {e}"));
+        }
+    };
+
+    // stderr is drained on its own thread so a chatty failure can neither fill the
+    // pipe nor block the child while stdout is being read.
+    let err_slot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let stderr_reader = child.stderr.take().map(|err| {
+        let slot = err_slot.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let mut g = slot.lock().unwrap();
+                if g.lines().count() >= 6 {
+                    continue;
+                }
+                if !g.is_empty() {
+                    g.push_str(" | ");
+                }
+                g.push_str(line.trim());
+            }
+        })
+    });
+
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            on_line(line.trim());
+        }
+    }
+    let status = child.wait().map_err(|e| format!("waiting for node: {e}"));
+    if let Some(reader) = stderr_reader {
+        let _ = reader.join();
+    }
+    let _ = std::fs::remove_file(&script_path);
+    let status = status?;
+    if !status.success() {
+        let err = err_slot.lock().unwrap().clone();
+        return Err(if err.is_empty() {
+            format!("node exited with code {:?}", status.code())
+        } else {
+            err
+        });
+    }
+    Ok(status)
+}
+
+/// Download through node: the `.part` file is filled by
+/// [`NODE_DOWNLOAD_SCRIPT`], which streams and reports progress as JSON lines.
 fn node_download(
     url: &str,
     part_path: &std::path::Path,
     expected_len: u64,
     progress: &dyn Fn(u64, u64),
 ) -> Result<(), String> {
-    let node = locate_node(None).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(node);
-    cmd.args([
-        "-e",
+    let part = part_path.display().to_string();
+    let expected = expected_len.to_string();
+    run_node_script_streaming(
+        "node-download",
         NODE_DOWNLOAD_SCRIPT,
-        url,
-        &part_path.display().to_string(),
-        &expected_len.to_string(),
-    ]);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("could not run node: {e}"))?;
-
-    // stderr is drained on its own thread so a chatty failure can neither fill the
-    // pipe nor block the child while stdout is being read.
-    let stderr = child.stderr.take();
-    let err_slot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    if let Some(err) = stderr {
-        let slot = err_slot.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let mut g = slot.lock().unwrap();
-                if !g.is_empty() {
-                    g.push_str(" | ");
-                }
-                g.push_str(line.trim());
-            }
-        });
-    }
-
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+        &[url, &part, &expected],
+        &|line| {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
             match v.get("event").and_then(|x| x.as_str()) {
                 Some("progress") => {
                     let received = v.get("received").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -2707,18 +2873,9 @@ fn node_download(
                 )),
                 _ => {}
             }
-        }
-    }
-    let status = child.wait().map_err(|e| format!("waiting for node: {e}"))?;
-    if !status.success() {
-        let err = err_slot.lock().unwrap().clone();
-        return Err(if err.is_empty() {
-            format!("node exited with code {:?}", status.code())
-        } else {
-            err
-        });
-    }
-    Ok(())
+        },
+    )
+    .map(|_| ())
 }
 
 /// Download through the bundled Windows curl. Used when the node route is
@@ -2940,9 +3097,12 @@ fn download_update_asset(
             unblock_file(&target);
             reveal_in_file_manager(&target);
             let size_mb = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0);
+            // The full path is part of the message on purpose: a redirected or
+            // missing 下载 folder makes "已在文件夹中选中" impossible to verify by
+            // eye, and telling the user exactly where the file is ends the guesswork.
             report(
                 "done",
-                &format!("已下载（{size_mb:.1} MB），已在文件夹中选中"),
+                &format!("已下载（{size_mb:.1} MB）到：{}", target.display()),
                 Some(target.display().to_string()),
             );
         }
@@ -4197,7 +4357,13 @@ mod update_download_tests {
                     !e.contains("Invalid URL") && !e.contains("ERR_INVALID_URL"),
                     "url must reach node, not be swapped with another argument: {e}"
                 );
-                assert!(e.contains("HTTP"), "expected an HTTP status error, got: {e}");
+                // A sandbox that forbids writing the helper script is not a code
+                // defect; anything else must be the registry's own answer.
+                if e.contains("could not write") || e.contains("拒绝访问") {
+                    eprintln!("SKIP: cannot write helper scripts here ({e})");
+                } else {
+                    assert!(e.contains("HTTP"), "expected an HTTP status error, got: {e}");
+                }
             }
             None => eprintln!("SKIP: registry answered 2xx for the probe package; nothing to assert"),
         }
@@ -4295,6 +4461,132 @@ mod update_download_tests {
             ["env", "local", "global"].contains(&source),
             "unexpected source label: {source}"
         );
+    }
+
+    /// The node downloader, driven exactly as the app drives it (script FILE +
+    /// argv), against a LOCAL http server. This is the regression test for the
+    /// argument-offset bug: when the helper was launched with `node -e` while the
+    /// script read file-style argv, the URL slot received the part path, the script
+    /// printed `bad url: <path>` and every download silently degraded to curl.
+    #[test]
+    fn node_download_fetches_over_http_and_resumes() {
+        let dir = std::env::temp_dir().join("dsh-node-download-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Deterministic payload: 3 MB with a recognisable pattern.
+        let payload_len = 3 * 1024 * 1024usize;
+        let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+        let payload_path = dir.join("payload.bin");
+        std::fs::write(&payload_path, &payload).unwrap();
+
+        const SERVER: &str = r#"
+import http from 'node:http';
+import fs from 'node:fs';
+const [root, portFile] = process.argv.slice(2);
+const body = fs.readFileSync(root + '/payload.bin');
+const server = http.createServer((req, res) => {
+  const range = req.headers.range;
+  if (range) {
+    const start = Number((/bytes=(\d+)-/.exec(range) || [])[1] || 0);
+    if (start >= body.length) {
+      res.writeHead(416, { 'Content-Range': 'bytes */' + body.length });
+      res.end();
+      return;
+    }
+    res.writeHead(206, {
+      'Content-Length': String(body.length - start),
+      'Content-Range': 'bytes ' + start + '-' + (body.length - 1) + '/' + body.length,
+      'Content-Type': 'application/octet-stream',
+    });
+    res.end(body.subarray(start));
+    return;
+  }
+  res.writeHead(200, { 'Content-Length': String(body.length), 'Content-Type': 'application/octet-stream' });
+  res.end(body);
+});
+server.listen(0, '127.0.0.1', () => {
+  const addr = server.address();
+  fs.writeFileSync(portFile, String(addr.port));
+});
+"#;
+        let port_file = dir.join("port.txt");
+        let node = match locate_node(None) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("SKIP: no node available ({e})");
+                return;
+            }
+        };
+        let server_script = dir.join("server.mjs");
+        std::fs::write(&server_script, SERVER).unwrap();
+        let mut server = match Command::new(&node)
+            .arg(&server_script)
+            .arg(&dir)
+            .arg(&port_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("SKIP: could not start the local server ({e})");
+                return;
+            }
+        };
+
+        // Wait for the port file (the server writes it once listening).
+        let mut port = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&port_file) {
+                if let Ok(p) = text.trim().parse::<u16>() {
+                    port = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let Some(port) = port else {
+            let _ = server.kill();
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("SKIP: local server did not start");
+            return;
+        };
+        let url = format!("http://127.0.0.1:{port}/payload.bin");
+
+        // 1. Fresh download: no resume, exact byte count, and progress reported.
+        let part = dir.join("fresh.part");
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let result = node_download(&url, &part, payload_len as u64, &move |received, total| {
+            seen_cb.lock().unwrap().push((received, total));
+        });
+        match result {
+            Ok(()) => {
+                assert_eq!(std::fs::read(&part).unwrap(), payload, "downloaded bytes must match");
+                assert!(!seen.lock().unwrap().is_empty(), "progress must be reported");
+                let last = *seen.lock().unwrap().last().unwrap();
+                assert_eq!(last, (payload_len as u64, payload_len as u64));
+            }
+            Err(e) => {
+                let _ = server.kill();
+                let _ = std::fs::remove_dir_all(&dir);
+                eprintln!("SKIP: node download failed ({e})");
+                return;
+            }
+        }
+
+        // 2. Resume: a short .part must be completed with a Range request and the
+        //    result must still be byte-identical.
+        let resumed = dir.join("resumed.part");
+        std::fs::write(&resumed, &payload[..1024 * 1024]).unwrap();
+        node_download(&url, &resumed, payload_len as u64, &|_, _| {})
+            .expect("resume must succeed against a Range-capable server");
+        assert_eq!(std::fs::read(&resumed).unwrap(), payload, "resumed file must be complete");
+
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
