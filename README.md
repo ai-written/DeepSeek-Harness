@@ -30,7 +30,7 @@ npm run build    # 打包 release
 - **启动日志**：所有关键步骤与 dsh 的 stderr 写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP），"双击没反应"可从这里排查
 - **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）
 - **不弹系统浏览器**：以 `--no-open` 启动 dsh，界面只出现在窗口内；不再做 `--help` 特性探测，启动更快（要求全局 dsh 支持 `--no-open`）
-- **更新提示**：每次启动检查 GitHub 最新版本（走 HTML 页面重定向，不占用 GitHub API 配额、静默失败、可配置更新源），有新版顶部横幅提示下载；点击"忽略此版本"后该版本不再提示
+- **更新提示**：每次启动检查 GitHub 最新版本（走 HTML 页面重定向，不占用 GitHub API 配额、静默失败、可配置更新源），有新版顶部横幅；点「下载更新」**直接下载合适的安装包到「下载」文件夹并在资源管理器中选中**，不跳转 GitHub（详见下文）；点击"忽略此版本"后该版本不再提示
 - **干净退出**：关闭窗口即杀掉 dsh 整棵进程树，无残留
 - **界面自愈**：release 与 dev 各自使用固定的 WebView2 缓存目录（release 为 `%LOCALAPPDATA%\com.deepseekharness.desktop\deepseek-harness-webview`）；若某次启动页面报出「Failed to load plugins」（客户端插件 bundle 加载失败），会自动清掉该目录并重启一次，而不是一直坏下去。带护栏：同一问题 10 分钟内最多自动重启 2 次，超出则保留报错不再重启；dev 构建只安排清理、不自动重启（避免与 cargo watcher 抢生命周期）。手动兜底：删掉那个目录再打开同样有效
 
@@ -57,8 +57,22 @@ npm run build    # 打包 release
 | `updateEndpoint` | HTML latest 页 | 自定义更新源，默认 `https://github.com/ai-written/DeepSeek-Harness/releases/latest`（HTML 重定向，不占 API 配额），可改为镜像 |
 | `ignoredUpdate` | — | 已忽略的版本（如 `v0.1.6`），由"忽略此版本"按钮写入 |
 
-> 每次启动检查一次、静默失败：后台线程 9 秒超时，先请求 HTML 的 `/releases/latest` 页面（302 重定向到最新 tag，**不消耗 GitHub API 配额**），失败时回退 GitHub API；有新版本时顶部弹出横幅（前往下载 / 忽略此版本），每次启动都会弹出（点 × 仅关闭本次），点击"忽略此版本"后该版本不再提示。发布说明（notes）尽力从 API 获取，失败时横幅照常弹出但无备注文字。
+> 每次启动检查一次、静默失败：后台线程 9 秒超时，先请求 HTML 的 `/releases/latest` 页面（302 重定向到最新 tag，**不消耗 GitHub API 配额**），失败时回退 GitHub API；有新版本时顶部弹出横幅，每次启动都会弹出（点 × 仅关闭本次），点击"忽略此版本"后该版本不再提示。发布说明（notes）尽力从 API 获取，失败时横幅照常弹出但无备注文字。
 > **生效检查**：日志会打印 `update check` / `native window decorations` / `usage badge` 等行。
+
+### 点击「下载更新」会发生什么
+
+**不再跳转 GitHub**：横幅按钮直接下载，流程如下。
+
+1. 检测到新版时，额外请求一次 `api.github.com/.../releases/tags/<tag>` 拿资产清单（仅在确有新版时请求，不影响"每次启动一次检查"的配额设计）。**若该请求失败**（例如共享/VPN 出口 IP 的匿名配额 60 次/小时已用尽 → 403），则按发布命名规则直接推导下载地址，**不依赖 API 也能下载**（代价是拿不到 `sha256`，跳过校验并在日志里注明）。
+2. **按当前形态自动选择安装包**：免安装版（exe 同级无卸载器、注册表无卸载项）下载 `..._x64-portable.exe`；NSIS/MSI 安装版下载 `..._x64-setup.exe`（或 `.msi`）。横幅副标题会写明"将下载免安装版/安装版 xxx.exe（大小）"，下载前即可确认。
+3. 下载到 `%USERPROFILE%\Downloads`，先写 `.part` 再改名。传输优先走 **node**（OpenSSL + 流式写入，副标题显示"已下载 x / y MB"实时进度，支持 Range 断点续传）；node 不可用时回退系统 `curl`。`.part` 大小与发布信息不符时丢弃重下，避免续传出错文件；同名文件存在时自动命名为 `xxx (2).exe`，不覆盖旧文件。
+4. 下载后校验发布页公布的 `sha256`（不匹配则删除并提示）；再 `Unblock-File` 解除"来自互联网"标记；最后在资源管理器中**选中该文件**，双击即可安装/使用。
+
+> 不自动运行安装包：由你决定何时安装（安装时会提示关闭正在运行的程序）。点「重新下载」可换一个副本，点「更新说明」就地展开 release notes。
+> 下载失败（网络、代理、无 node/curl、资产不存在等）会自动回退到打开 GitHub 发布页，按钮不会变成死路；尤其当推导出的资产名 404（发布时改了文件名）时会打开发布页让你手选。
+
+> **HTTPS 走多路回退**：更新检查与下载的 HTTPS 依次尝试 `curl`（Windows 为 schannel）→ PowerShell(`Invoke-WebRequest`) → **node**。这样在某台机器上 Windows 的 schannel/.NET TLS 不可用时（典型报错 `SEC_E_NO_CREDENTIALS`、`Authentication failed`，被安全策略或加固工具锁掉凭据存储时会出现）仍能正常工作——node 是运行本应用的硬性依赖，它的 OpenSSL 不依赖该凭据存储。日志会记录每个路由的失败原因。
 
 同目录的 `usage-pricing.json` 是计费价格/汇率配置（见「每日用量徽标」）。
 
@@ -72,11 +86,16 @@ npm run build
 
 | 产物 | 说明 |
 |---|---|
-| `deepseek-harness.exe` | 免安装版，单文件双击即用；CI 发布为 `DeepSeek-Harness_<version>_x64-portable.exe` |
-| `bundle/nsis/DeepSeek-Harness_<version>_x64-setup.exe` | NSIS 安装包 |
-| `bundle/msi/DeepSeek-Harness_<version>_x64_en-US.msi` | MSI 安装包 |
+| `deepseek-harness.exe` | 免安装版，单文件双击即用（不含卸载器）；CI 发布为 `DeepSeek-Harness_<version>_x64-portable.exe` |
+| `bundle/nsis/DeepSeek-Harness_<version>_x64-setup.exe` | NSIS 安装包（含卸载器） |
+| `bundle/msi/DeepSeek-Harness_<version>_x64_en-US.msi` | MSI 安装包（含卸载器） |
+
+> 发布时三种产物都会上传。应用内「下载更新」按**当前形态**挑选：exe 同级有卸载器（或注册表有卸载项）视为安装版 → 下载 `setup.exe`；否则视为免安装版 → 下载 `portable.exe`。判据与选择结果都记在 `startup.log` 里（`update download: build kind -> …`、`best match for this build -> …`）。
+>
+> ⚠️ **不要改动发布资产的命名**：API 不可用时会按 `DeepSeek-Harness_<版本>_x64-{portable,setup}.exe` / `..._x64_en-US.msi` 推导下载地址（`<版本>` 取 tag 去掉 `v`）。改了名字只会导致推导 404，届时按钮仍会打开 release 页，但应用内直下就失效了。
 
 > **免安装版首次运行**：浏览器下载的 exe 带"来自互联网"标记，SmartScreen 可能静默拦截双击。右键 exe → 属性 → 勾选**解除锁定**（或 `Unblock-File`）。彻底解决需代码签名。
+> 应用内「下载更新」已自动 `Unblock-File`，无需手动解除。
 >
 > 目标机器需 Node ≥ 22 + 全局 `@deepseek-ai/dsh`（支持 `--no-open` 的版本）；安装包本身**不含 dsh**。
 
