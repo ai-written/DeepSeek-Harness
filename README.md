@@ -28,7 +28,7 @@ npm run build    # 打包 release
 - **无边框窗口**：默认自定义标题栏（最小化 / 最大化 / 关闭），支持拖拽；可配置切换系统原生标题栏（见「配置」）
 - **无控制台闪窗**：直接 spawn `node.exe`，不弹 cmd 窗口
 - **启动日志**：所有关键步骤与 dsh 的 stderr 写入 `%LOCALAPPDATA%\deepseek-harness\startup.log`（不可写时回退 TEMP），"双击没反应"可从这里排查
-- **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）
+- **每日用量徽标**：左下角 ¥ 胶囊实时显示当日估算费用，点击可编辑汇率与单价（见下文）；弹窗第三个页签可查看/安装/切换 `@deepseek-ai/dsh` 版本（见「dsh 版本管理」）
 - **不弹系统浏览器**：以 `--no-open` 启动 dsh，界面只出现在窗口内；不再做 `--help` 特性探测，启动更快（要求全局 dsh 支持 `--no-open`）
 - **更新提示**：每次启动检查 GitHub 最新版本（走 HTML 页面重定向，不占用 GitHub API 配额、静默失败、可配置更新源），有新版顶部横幅；点「下载更新」**直接下载合适的安装包到「下载」文件夹并在资源管理器中选中**，不跳转 GitHub（详见下文）；点击"忽略此版本"后该版本不再提示
 - **干净退出**：关闭窗口即杀掉 dsh 整棵进程树，无残留
@@ -56,6 +56,7 @@ npm run build    # 打包 release
 | `updateCheck` | `true` | 是否在启动时检查 GitHub 更新；`false` 则跳过网络请求 |
 | `updateEndpoint` | HTML latest 页 | 自定义更新源，默认 `https://github.com/ai-written/DeepSeek-Harness/releases/latest`（HTML 重定向，不占 API 配额），可改为镜像 |
 | `ignoredUpdate` | — | 已忽略的版本（如 `v0.1.6`），由"忽略此版本"按钮写入 |
+| `npmRegistry` | `https://registry.npmjs.org` | 「dsh 版本」页签查询/安装 dsh 时使用的 npm 源，可改镜像（如 `https://registry.npmmirror.com`） |
 
 > 每次启动检查一次、静默失败：后台线程 9 秒超时，先请求 HTML 的 `/releases/latest` 页面（302 重定向到最新 tag，**不消耗 GitHub API 配额**），失败时回退 GitHub API；有新版本时顶部弹出横幅，每次启动都会弹出（点 × 仅关闭本次），点击"忽略此版本"后该版本不再提示。发布说明（notes）尽力从 API 获取，失败时横幅照常弹出但无备注文字。
 > **生效检查**：日志会打印 `update check` / `native window decorations` / `usage badge` 等行。
@@ -75,6 +76,19 @@ npm run build    # 打包 release
 > **HTTPS 走多路回退**：更新检查与下载的 HTTPS 依次尝试 `curl`（Windows 为 schannel）→ PowerShell(`Invoke-WebRequest`) → **node**。这样在某台机器上 Windows 的 schannel/.NET TLS 不可用时（典型报错 `SEC_E_NO_CREDENTIALS`、`Authentication failed`，被安全策略或加固工具锁掉凭据存储时会出现）仍能正常工作——node 是运行本应用的硬性依赖，它的 OpenSSL 不依赖该凭据存储。日志会记录每个路由的失败原因。
 
 同目录的 `usage-pricing.json` 是计费价格/汇率配置（见「每日用量徽标」）。
+
+## dsh 版本管理（用量弹窗 →「dsh 版本」）
+
+左下角 ¥ 徽标点开的弹窗里有三个页签：**周用量 / 单价配置 / dsh 版本**。第三个页签用来管理本机 `@deepseek-ai/dsh` 的版本：
+
+- **列出**：当前运行的 dsh 版本与来源（`全局安装` / `版本目录` / `DSH_BIN`）、版本目录中已安装的版本、npm 上最新的 15 个版本（含 `latest` / `next` / `alpha` 标签），按 semver 倒序（预发布版正确排在正式版之后）。
+- **安装**：`npm install --prefix <dsh home>/versions/<版本>`，**不改动全局 npm 环境**（命令行里的 `dsh` 仍是全局那个版本）。安装缓存放在版本目录内，避免共享 npm 缓存被占用/不可写导致安装失败。
+- **切换**：写入 `<dsh home>/storages/dsh-versions.json` 的 `activeVersion`，**重启应用后生效**（点「重启应用」；不会自动重启，避免打断正在进行的会话）。「回到全局安装」即清空该字段。
+- **删除**：删除版本目录里的副本；当前选中的版本不允许删除（先切走）。
+- 启动时 dsh 的解析顺序：`$DSH_BIN` → 版本目录里选中的版本（文件缺失则跳过并记录日志）→ 全局安装。所以任何一次切换都可以随时退回，不会把应用锁死。
+- 读取 npm 走 `npmRegistry`（默认官方源）；失败时页签照常显示当前/已安装版本，并给出错误信息，也可用国内镜像。
+
+> 该功能需要 npm（随 Node ≥ 22 一起提供）。安装包本身仍不含 dsh，终端里执行 `dsh` 用的是全局安装的版本。
 
 ## 打包发布
 

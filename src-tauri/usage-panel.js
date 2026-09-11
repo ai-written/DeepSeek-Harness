@@ -112,7 +112,22 @@
   let modalSaveBtn = null
   let tabChartEl = null
   let tabFormEl = null
+  let tabVersionsEl = null
   let modalPayload = null
+  // ── dsh version tab state ───────────────────────────────────────────────────
+  // The last `dsh-versions-data` payload, the version currently being installed
+  // (for the progress line) and the small "OK/失败" status text.
+  let versionsInfo = null
+  let versionsBusy = ''
+  let versionsStatus = ''
+  let versionsStatusKind = ''
+  let versionsProgress = ''
+  /// A list request is in flight (prevents stacking registry calls).
+  let versionsPending = false
+  /// Version awaiting a second "删除" click to confirm.
+  let versionsConfirmDelete = ''
+  /// Keep the status line when the next data payload arrives (set after an
+  /// action's result, so the user's "已切换/已删除" message is not wiped).
   const FIELDS = [
     ['inputPerMillion', '输入（每百万$）'],
     ['cacheReadPerMillion', '缓存读（每百万$）'],
@@ -146,14 +161,16 @@
     head.appendChild(title)
     head.appendChild(subtitle)
 
-    // Tab bar (two sub-tabs, styled like harness settings tabs).
+    // Tab bar (sub-tabs, styled like harness settings tabs).
     const tabbar = document.createElement('div')
     tabbar.style.cssText =
       'display:flex;gap:4px;margin-bottom:14px;padding:3px;border-radius:9px;background:#f0f2f5;'
     tabChartEl = makeTab('周用量')
     tabFormEl = makeTab('单价配置')
+    tabVersionsEl = makeTab('dsh 版本')
     tabbar.appendChild(tabChartEl)
     tabbar.appendChild(tabFormEl)
+    tabbar.appendChild(tabVersionsEl)
 
     modalContent = document.createElement('div') // populated by renderChartTab / renderFormTab
 
@@ -179,6 +196,7 @@
 
     tabChartEl.onclick = () => selectTab('chart')
     tabFormEl.onclick = () => selectTab('form')
+    tabVersionsEl.onclick = () => selectTab('versions')
     modal.addEventListener('mousedown', (e) => {
       if (e.target === modal) closeModal()
     })
@@ -214,15 +232,20 @@
 
   function selectTab(name) {
     const isChart = name === 'chart'
+    const isForm = name === 'form'
+    const isVersions = name === 'versions'
     setTabActive(tabChartEl, isChart)
-    setTabActive(tabFormEl, !isChart)
-    if (isChart) {
-      modalFooter.style.display = 'none'
-      renderChartTab()
-    } else {
-      modalFooter.style.display = 'flex'
-      renderFormTab()
-    }
+    setTabActive(tabFormEl, isForm)
+    setTabActive(tabVersionsEl, isVersions)
+    // The footer carries the pricing form's 保存 button; the chart and version
+    // tabs are view/action-only, so it is hidden there.
+    modalFooter.style.display = isForm ? 'flex' : 'none'
+    if (isChart) renderChartTab()
+    else if (isForm) renderFormTab()
+    // Opening the version tab without a cached payload must FETCH it: rendering
+    // alone would leave the tab stuck on "正在读取…" forever.
+    else if (versionsInfo) renderVersionsTab()
+    else requestVersionsList()
   }
 
   // Buttons: primary = blue gradient + glow, secondary = soft light fill.
@@ -1198,6 +1221,283 @@
     })
   }
 
+  // ── dsh version tab ─────────────────────────────────────────────────────────
+  // Shows which dsh the shell runs, which versions are installed in the version
+  // directory (`<dsh home>/versions/`), and which versions npm publishes. The
+  // global install is never modified: installing a version writes a separate
+  // prefix, and selecting one only rewrites dsh-versions.json — so switching
+  // back is always possible and the app restart applies it.
+  const V_ROW =
+    'display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;border:1px solid #e4e8ed;' +
+    'background:#fbfcfd;margin-bottom:6px;'
+  const V_CHIP =
+    'font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:6px;white-space:nowrap;'
+  const V_ACTION =
+    'padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;font-family:inherit;' +
+    'border:1px solid #d0d7de;background:#f6f8fa;color:#24292f;white-space:nowrap;'
+  const V_ACTION_PRIMARY =
+    'padding:4px 10px;border-radius:7px;font-size:11.5px;font-weight:600;cursor:pointer;font-family:inherit;' +
+    'border:none;background:linear-gradient(135deg,#3b82f6,#2563eb);color:#ffffff;white-space:nowrap;'
+  const V_MUTED = 'font-size:11px;color:#768390;'
+
+  function smallButton(text, primary, onclick) {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.textContent = text
+    b.style.cssText = primary ? V_ACTION_PRIMARY : V_ACTION
+    b.onclick = onclick
+    return b
+  }
+
+  function chip(text, color) {
+    const s = document.createElement('span')
+    s.textContent = text
+    s.style.cssText = V_CHIP + 'color:' + color + ';background:' + color + '1f;'
+    return s
+  }
+
+  function versionsStatusBox(preserve) {
+    // `preserve` keeps the message through the automatic refresh that follows an
+    // action, so "安装完成" does not vanish the moment the list reloads.
+    if (!versionsStatus || !preserve) return null
+    const d = document.createElement('div')
+    d.textContent = versionsStatus
+    const color = versionsStatusKind === 'error' ? '#b42318' : versionsStatusKind === 'ok' ? '#1a7f37' : '#57606a'
+    d.style.cssText =
+      'margin:8px 0;font-size:11.5px;line-height:1.45;color:' + color + ';white-space:pre-wrap;word-break:break-all;'
+    return d
+  }
+
+  function renderVersionsTab() {
+    const body = modalContent
+    body.innerHTML = ''
+    const info = versionsInfo
+
+    if (!info) {
+      // Only claim to be loading while a request is actually in flight: after a
+      // refresh the payload is dropped (versionsInfo = null) while the previous
+      // render is still on screen, and an unconditional "正在读取…" would linger
+      // ABOVE the results that replace it.
+      if (versionsPending) {
+        body.appendChild(labelledNote('正在读取 npm 上的版本列表…', '读取失败时可点下方「刷新」重试。'))
+      }
+      const statusBoxNoInfo = versionsStatusBox(true)
+      if (statusBoxNoInfo) body.appendChild(statusBoxNoInfo)
+      const actions = document.createElement('div')
+      actions.style.cssText = 'display:flex;gap:8px;margin-top:10px;'
+      actions.appendChild(smallButton('刷新', true, requestVersions))
+      body.appendChild(actions)
+      return
+    }
+
+    // Current
+    const head = document.createElement('div')
+    head.style.cssText = 'padding:10px 12px;border-radius:9px;background:#f6f8fa;border:1px solid #e4e8ed;'
+    const line1 = document.createElement('div')
+    line1.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:#1f2328;'
+    const line1Text = document.createElement('div')
+    line1Text.textContent = '当前 dsh：' + (info.activeVersion || '未知')
+    line1.appendChild(line1Text)
+    line1.appendChild(chip(info.sourceLabel || info.source || '未知', '#1f6feb'))
+    if (versionsBusy === '__global__') line1.appendChild(chip('切换中…', '#bf8700'))
+    head.appendChild(line1)
+    const line2 = document.createElement('div')
+    line2.style.cssText = V_MUTED + 'margin-top:4px;word-break:break-all;'
+    line2.textContent = info.activePath || ''
+    line2.title = info.activePath || ''
+    head.appendChild(line2)
+    body.appendChild(head)
+
+    const statusBox = versionsStatusBox(true)
+    if (statusBox) body.appendChild(statusBox)
+    if (versionsBusy && versionsBusy !== '__global__') {
+      const p = document.createElement('div')
+      p.style.cssText = 'margin:8px 0;font-size:11.5px;color:#57606a;word-break:break-all;'
+      p.textContent = '正在安装 ' + versionsBusy + '…' + (versionsProgress ? ' ' + versionsProgress : '')
+      body.appendChild(p)
+    }
+
+    // Installed locally
+    const installed = Array.isArray(info.installed) ? info.installed : []
+    body.appendChild(label('版本目录中已安装（' + (info.versionsRoot || '') + '）'))
+    if (!installed.length) {
+      body.appendChild(labelledNote('还没有额外安装的版本，从下面列表里选一个装吧。'))
+    }
+    for (const row of installed) {
+      const el = document.createElement('div')
+      el.style.cssText = V_ROW
+      const name = document.createElement('div')
+      name.style.cssText = 'flex:1;min-width:0;font-size:12.5px;font-weight:600;color:#1f2328;'
+      name.textContent = row.version
+      el.appendChild(name)
+      if (row.active) el.appendChild(chip('运行中', '#1a7f37'))
+      if (!row.complete) el.appendChild(chip('安装不完整', '#bf8700'))
+      const busy = versionsBusy === row.version
+      if (busy) {
+        el.appendChild(chip('安装中…', '#bf8700'))
+      } else if (!row.active && row.complete) {
+        el.appendChild(smallButton('切换', false, () => switchVersion(row.version)))
+      }
+      if (!row.active) {
+        if (versionsConfirmDelete === row.version) {
+          el.appendChild(smallButton('确认删除', false, () => removeVersion(row.version)))
+          el.appendChild(smallButton('取消', false, () => {
+            versionsConfirmDelete = ''
+            renderVersionsTab()
+          }))
+        } else {
+          el.appendChild(
+            smallButton('删除', false, () => {
+              versionsConfirmDelete = row.version
+              renderVersionsTab()
+            }),
+          )
+        }
+      }
+      body.appendChild(el)
+    }
+
+    // Registry versions
+    body.appendChild(label('npm 上的版本（最新 ' + (info.limit || 15) + ' 个）'))
+    if (info.registryError) {
+      const e = document.createElement('div')
+      e.style.cssText = 'margin:6px 0;font-size:11.5px;color:#b42318;word-break:break-all;'
+      e.textContent = '读取 npm 失败：' + info.registryError + '（仍可切换到已安装的版本）'
+      body.appendChild(e)
+    }
+    const list = Array.isArray(info.versions) ? info.versions : []
+    if (!list.length && !info.registryError) body.appendChild(labelledNote('没有可显示的版本。'))
+    for (const row of list) {
+      const el = document.createElement('div')
+      el.style.cssText = V_ROW
+      const name = document.createElement('div')
+      name.style.cssText = 'flex:1;min-width:0;font-size:12.5px;font-weight:600;color:#1f2328;'
+      name.textContent = row.version
+      el.appendChild(name)
+      for (const tag of row.tags || []) {
+        el.appendChild(chip(tag, tag === 'latest' ? '#1a7f37' : '#8250df'))
+      }
+      if (row.active) el.appendChild(chip('运行中', '#1a7f37'))
+      else if (row.installed && row.broken) el.appendChild(chip('安装不完整', '#bf8700'))
+      else if (row.installed) el.appendChild(chip('已安装', '#0969da'))
+      const busy = versionsBusy === row.version
+      if (busy) {
+        el.appendChild(chip('安装中…', '#bf8700'))
+      } else if (!row.active && row.installed && !row.broken) {
+        el.appendChild(smallButton('切换', false, () => switchVersion(row.version)))
+      } else if (!row.installed) {
+        el.appendChild(smallButton('安装（并切换）', true, () => installVersion(row.version)))
+      } else {
+        el.appendChild(smallButton('重新安装', false, () => installVersion(row.version)))
+      }
+      body.appendChild(el)
+    }
+
+    // Actions
+    body.appendChild(label('操作'))
+    const actions = document.createElement('div')
+    actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;'
+    actions.appendChild(smallButton('刷新列表', false, requestVersions))
+    if (info.source === 'local') {
+      actions.appendChild(
+        smallButton('回到全局安装', false, () => {
+          versionsStatus = '已选择全局安装，重启后生效。'
+          versionsStatusKind = 'ok'
+          emitToBackend('dsh-versions-switch', { global: true })
+        }),
+      )
+    }
+    actions.appendChild(smallButton('重启应用', true, restartApp))
+    body.appendChild(actions)
+    const hint = document.createElement('div')
+    hint.style.cssText = V_MUTED + 'line-height:1.5;'
+    hint.textContent =
+      '安装到版本目录，不会改动全局 npm 环境；切换或安装后需要重启应用才会用新版本。' +
+      '重启会关闭当前窗口（正在进行的会话请先结束）。'
+    body.appendChild(hint)
+  }
+
+  function labelledNote(text, extra) {
+    const box = document.createElement('div')
+    box.style.cssText = 'font-size:11.5px;color:#57606a;line-height:1.5;'
+    box.textContent = text
+    if (extra) {
+      const e = document.createElement('div')
+      e.style.cssText = 'margin-top:3px;color:#8b949e;'
+      e.textContent = extra
+      box.appendChild(e)
+    }
+    return box
+  }
+
+  function emitToBackend(name, payload) {
+    try {
+      if (Tauri.event && Tauri.event.emit) Tauri.event.emit(name, payload).catch(() => {})
+    } catch {
+      /* noop */
+    }
+  }
+
+  function requestVersions(options) {
+    const keep = !!(options && options.keepStatus)
+    if (!keep) {
+      versionsStatus = ''
+      versionsStatusKind = ''
+    }
+    versionsPending = true
+    // The status box is its own element and survives this re-render, so a refresh
+    // triggered by an action keeps showing that action's message.
+    renderVersionsTab()
+    emitToBackend('dsh-versions-list', {})
+  }
+
+  /**
+   * Fetch the version list unless one is already in flight (opening and
+   * re-opening the tab, or clicking 刷新 twice, must not stack registry calls).
+   */
+  function requestVersionsList() {
+    if (versionsPending) return
+    requestVersions()
+  }
+
+  /**
+   * Refresh the list while keeping the status line that was just set (the
+   * automatic reload after install/switch/删除). The hold flag is raised AFTER
+   * requestVersions() because that call re-renders synchronously: raising it
+   * first would not help, and letting it end up false would drop the message
+   * from that very render.
+   */
+  function refreshVersionsKeepingStatus() {
+    requestVersions({ keepStatus: true })
+  }
+
+  function installVersion(version) {
+    versionsBusy = version
+    versionsProgress = ''
+    versionsStatus = '正在安装 ' + version + '（npm 下载中，可能需要几十秒）…'
+    versionsStatusKind = 'info'
+    renderVersionsTab()
+    emitToBackend('dsh-versions-install', { version })
+  }
+
+  function switchVersion(version) {
+    versionsStatus = '正在切换到 ' + version + '…'
+    versionsStatusKind = 'info'
+    emitToBackend('dsh-versions-switch', { version })
+  }
+
+  function removeVersion(version) {
+    versionsStatus = '正在删除 ' + version + '…'
+    versionsStatusKind = 'info'
+    emitToBackend('dsh-versions-remove', { version })
+  }
+
+  function restartApp() {
+    versionsStatus = '正在重启应用…'
+    versionsStatusKind = 'ok'
+    emitToBackend('dsh-app-restart', {})
+  }
+
   function parsePricing(text) {
     try {
       const p = JSON.parse(text)
@@ -1320,6 +1620,78 @@
         if (lastStatusEl) {
           lastStatusEl.textContent = ack === 'ok' ? '已保存，3 秒内生效' : '保存失败：' + (ack || '无响应')
           if (ack === 'ok') setTimeout(closeModal, 900)
+        }
+      })
+      .catch(() => {})
+
+    // ── dsh version tab ───────────────────────────────────────────────────────
+    Tauri.event
+      .listen('dsh-versions-data', (e) => {
+        try {
+          const payload = typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload
+          versionsPending = false
+          versionsInfo = payload && payload.ok ? payload : null
+          if (!versionsInfo) {
+            versionsStatus = '读取版本信息失败'
+            versionsStatusKind = 'error'
+          }
+          if (modal && modal.style.display !== 'none' && tabVersionsEl && tabVersionsEl._active) renderVersionsTab()
+        } catch {
+          /* tolerate malformed payload */
+        }
+      })
+      .catch(() => {})
+
+    Tauri.event
+      .listen('dsh-versions-install-progress', (e) => {
+        try {
+          const d = typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload
+          versionsProgress = d && d.line ? String(d.line).slice(-120) : ''
+          if (modal && modal.style.display !== 'none' && tabVersionsEl && tabVersionsEl._active) renderVersionsTab()
+        } catch {
+          /* noop */
+        }
+      })
+      .catch(() => {})
+
+    Tauri.event
+      .listen('dsh-versions-install-result', (e) => {
+        try {
+          const d = typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload
+          if (!d || d.state === 'started') return
+          versionsBusy = ''
+          versionsProgress = ''
+          versionsStatus = d.ok ? d.message || '安装完成' : '安装失败：' + (d.error || '未知错误')
+          versionsStatusKind = d.ok ? 'ok' : 'error'
+          refreshVersionsKeepingStatus()
+        } catch {
+          /* noop */
+        }
+      })
+      .catch(() => {})
+
+    Tauri.event
+      .listen('dsh-versions-switch-result', (e) => {
+        try {
+          const d = typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload
+          versionsStatus = d && d.ok ? (d.message || '已切换') + '，重启后生效' : '切换失败：' + ((d && d.error) || '未知错误')
+          versionsStatusKind = d && d.ok ? 'ok' : 'error'
+          refreshVersionsKeepingStatus()
+        } catch {
+          /* noop */
+        }
+      })
+      .catch(() => {})
+
+    Tauri.event
+      .listen('dsh-versions-remove-result', (e) => {
+        try {
+          const d = typeof e.payload === 'string' ? JSON.parse(e.payload) : e.payload
+          versionsStatus = d && d.ok ? d.message || '已删除' : '删除失败：' + ((d && d.error) || '未知错误')
+          versionsStatusKind = d && d.ok ? 'ok' : 'error'
+          refreshVersionsKeepingStatus()
+        } catch {
+          /* noop */
         }
       })
       .catch(() => {})

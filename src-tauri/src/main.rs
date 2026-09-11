@@ -377,13 +377,17 @@ fn spawn_harness() -> std::io::Result<Child> {
         // back to any node.exe on PATH. This also works on machines where
         // node.exe and the npm global prefix live in different directories
         // (nvm / custom npm prefixes), not just the sibling-layout install.
-        let bin_js = match locate_dsh_bin_js() {
-            Ok(b) => {
-                log_line(&format!("dsh bin.js -> {}", b.display()));
-                b
+        let bin_js = match resolve_dsh_bin_js() {
+            Ok(r) => {
+                log_line(&format!(
+                    "dsh source: {} (version {})",
+                    r.source.label(),
+                    r.version.as_deref().unwrap_or("unknown")
+                ));
+                r.bin_js
             }
             Err(e) => {
-                log_line(&format!("locate_dsh_bin_js failed: {e}"));
+                log_line(&format!("resolve_dsh_bin_js failed: {e}"));
                 return Err(e);
             }
         };
@@ -473,9 +477,10 @@ fn locate_node(preferred_dir: Option<&std::path::Path>) -> std::io::Result<std::
 }
 
 /// Locate the `dsh.cmd` shim on PATH. npm always places the shim in the same
-/// directory as its node_modules, so `lib/bin.js` resolves relative to the
-/// shim's directory — this works even when node.exe and the npm global prefix
-/// are in different directories (nvm / custom npm prefixes).
+/// directory as its node_modules, so the sibling `lib/bin.js` of the global
+/// install resolves relative to the shim's directory — this works even when
+/// node.exe and the npm global prefix are in different directories (nvm /
+/// custom npm prefixes). [`resolve_dsh_bin_js`] builds on this.
 #[cfg(target_os = "windows")]
 fn locate_dsh_cmd() -> std::io::Result<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH").ok_or_else(|| std::io::Error::other("PATH not set"))?;
@@ -489,39 +494,6 @@ fn locate_dsh_cmd() -> std::io::Result<std::path::PathBuf> {
     Err(std::io::Error::other(
         "dsh.cmd not found on PATH — run `npm install -g @deepseek-ai/dsh`",
     ))
-}
-
-/// Resolve dsh's `lib/bin.js`. Priority:
-///   1. `$DSH_BIN` — explicit override (absolute path to bin.js)
-///   2. the `dsh.cmd` shim on PATH → sibling `node_modules/@deepseek-ai/dsh/lib/bin.js`
-#[cfg(target_os = "windows")]
-fn locate_dsh_bin_js() -> std::io::Result<std::path::PathBuf> {
-    if let Ok(explicit) = std::env::var("DSH_BIN") {
-        let p = std::path::PathBuf::from(&explicit);
-        if p.exists() {
-            log_line(&format!("dsh bin.js -> {} (from DSH_BIN)", p.display()));
-            return Ok(p);
-        }
-        log_line(&format!("DSH_BIN set but not found: {explicit}; falling back to dsh.cmd on PATH"));
-    }
-    let shim = locate_dsh_cmd()?;
-    let dir = shim
-        .parent()
-        .ok_or_else(|| std::io::Error::other("dsh.cmd has no parent dir"))?;
-    let bin_js = dir
-        .join("node_modules")
-        .join("@deepseek-ai")
-        .join("dsh")
-        .join("lib")
-        .join("bin.js");
-    if bin_js.exists() {
-        Ok(bin_js)
-    } else {
-        Err(std::io::Error::other(format!(
-            "dsh install not found at {} — run `npm install -g @deepseek-ai/dsh`",
-            bin_js.display()
-        )))
-    }
 }
 
 /// Blocking: read dsh's stdout until the ready line appears, return the URL.
@@ -840,20 +812,22 @@ fn set_usage_polling(state: &Arc<UsageState>, paused: bool) {
     }
 }
 
-/// A file under the dsh home's `storages` directory, shared with the CLI.
-/// `DSH_HOME` (when set) IS the `.dsh` directory itself — the same convention
-/// as the usage sidecar and dsh's own home resolution; otherwise fall back to
-/// `~/.dsh`.
-fn dsh_storages_file(name: &str) -> std::path::PathBuf {
-    let home = match std::env::var("DSH_HOME") {
-        Ok(h) => std::path::PathBuf::from(h),
-        Err(_) => std::env::var_os("USERPROFILE")
+/// The dsh home directory. `DSH_HOME` (when set) IS the `.dsh` directory itself,
+/// otherwise `~/.dsh` — the same convention as dsh's own home resolution.
+fn dsh_home() -> std::path::PathBuf {
+    match std::env::var("DSH_HOME") {
+        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
+        _ => std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join(".dsh"),
-    };
-    home.join("storages").join(name)
+    }
+}
+
+/// A file under the dsh home's `storages` directory, shared with the CLI.
+fn dsh_storages_file(name: &str) -> std::path::PathBuf {
+    dsh_home().join("storages").join(name)
 }
 
 /// Resolve the pricing config file path (shared with the sidecar).
@@ -902,6 +876,9 @@ const DEFAULT_UPDATE_ENDPOINT: &str =
 const DEFAULT_API_ENDPOINT: &str =
     "https://api.github.com/repos/ai-written/DeepSeek-Harness/releases/latest";
 const DEFAULT_UPDATE_URL: &str = "https://github.com/ai-written/DeepSeek-Harness";
+/// npm registry the "dsh 版本" tab reads version metadata from and installs
+/// from. Overridable through `npmRegistry` in desktop-settings.json.
+const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 
 /// Parsed `desktop-settings.json` (auto-created with defaults on first launch).
 struct DesktopSettings {
@@ -918,6 +895,9 @@ struct DesktopSettings {
     update_endpoint: String,
     /// Ignored update version tag (e.g. "v0.1.6").
     ignored_update: Option<String>,
+    /// npm registry used by the "dsh 版本" tab (lets a mirror/private registry
+    /// be used). Default: https://registry.npmjs.org
+    npm_registry: String,
 }
 
 /// Read `desktop-settings.json` under the dsh storages dir, applying defaults
@@ -946,12 +926,20 @@ fn read_desktop_settings() -> DesktopSettings {
         .and_then(|v| v.get("ignoredUpdate"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let npm_registry = value
+        .as_ref()
+        .and_then(|v| v.get("npmRegistry"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| DEFAULT_NPM_REGISTRY.to_string());
     let settings = DesktopSettings {
         native_decorations: get_bool("decorations", false),
         usage_badge: get_bool("usageBadge", true),
         update_check: get_bool("updateCheck", true),
         update_endpoint,
         ignored_update,
+        npm_registry,
     };
     log_line(&format!(
         "native window decorations (desktop-settings.json): {}",
@@ -1100,29 +1088,26 @@ fn http_get(url: &str) -> Result<String, String> {
 /// `SEC_E_NO_CREDENTIALS` and .NET with "Authentication failed". Node is already
 /// a hard requirement of this shell, so it is a dependable route.
 fn node_get(url: &str) -> Result<String, String> {
+    // ESM (`import`, not `require`): the script runs from a `.mjs` file, where
+    // `require` is not defined — that failure looks like an unrelated stack trace.
     const SCRIPT: &str = r#"
+import https from 'node:https';
+// argv[2] because this runs from a script FILE (see run_node_script); with
+// `node -e` the arguments would start at argv[1] instead — mixing the two up
+// silently passes the wrong string as the URL.
 const target = process.argv[2];
-const req = require('https').get(target, { headers: { 'User-Agent': 'deepseek-harness-desktop', 'Accept': 'application/vnd.github+json' } }, (res) => {
-  if (res.statusCode >= 400) { process.stderr.write('HTTP ' + res.statusCode); process.exit(1); }
-  let body = '';
-  res.on('data', (c) => { body += c; });
-  res.on('end', () => { process.stdout.write(body); });
+const req = https.get(target, {
+  headers: { 'User-Agent': 'deepseek-harness-desktop', 'Accept': 'application/vnd.github+json' },
+}, (res) => {
+  if (res.statusCode >= 400) { process.stderr.write('HTTP ' + res.statusCode + '\n'); process.exit(1); }
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => { process.stdout.write(Buffer.concat(chunks)); });
 });
-req.on('error', (e) => { process.stderr.write(String(e.message || e)); process.exit(1); });
-req.setTimeout(12000, () => { process.stderr.write('timeout after 12s'); req.destroy(); });
+req.on('error', (e) => { process.stderr.write(String(e.message || e) + '\n'); process.exit(1); });
+req.setTimeout(12000, () => { req.destroy(); process.stderr.write('timeout after 12s\n'); });
 "#;
-    let node = locate_node(None).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(node);
-    cmd.args(["-e", SCRIPT, url]);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("could not run node: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() { "node exited with an error".into() } else { err });
-    }
-    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    let body = run_node_script("node-get", SCRIPT, &[url])?;
     if body.trim().is_empty() {
         return Err("empty response from node".into());
     }
@@ -1404,6 +1389,700 @@ fn installed_in_registry() -> bool {
 #[cfg(not(target_os = "windows"))]
 fn installed_in_registry() -> bool {
     false
+}
+
+// ── dsh version manager ──────────────────────────────────────────────────────
+// The usage dialog's "dsh 版本" tab lists the versions published on npm, says
+// which one is running, and can install a version WITHOUT touching the global
+// npm prefix: each install lands in `<dsh home>/versions/<version>/` via
+// `npm install --prefix`. Switching then only rewrites `dsh-versions.json` and
+// restarts the shell — the global install (and `dsh` on PATH) is never modified,
+// so a bad version is one restart away from being rolled back, and no admin
+// rights are needed for a global prefix.
+
+/// Package the version tab manages.
+const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
+/// How long a single `npm install` may take (it downloads the package plus its
+/// platform binary). Generous, but bounded so the UI cannot hang forever.
+const NPM_INSTALL_TIMEOUT_SECS: u32 = 600;
+/// Newest versions listed in the tab (installed ones are always included).
+const VERSION_LIST_LIMIT: usize = 15;
+
+/// Where the *running* dsh comes from.
+#[derive(serde::Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum DshSource {
+    /// Overridden by the `DSH_BIN` environment variable.
+    Env,
+    /// `dsh-versions.json` points at a copy under `<dsh home>/versions/`.
+    Local,
+    /// The global npm install (`dsh.cmd` on PATH).
+    Global,
+}
+
+impl DshSource {
+    fn label(self) -> &'static str {
+        match self {
+            DshSource::Env => "DSH_BIN",
+            DshSource::Local => "版本目录",
+            DshSource::Global => "全局安装",
+        }
+    }
+}
+
+/// `<dsh home>/versions/<version>/node_modules/@deepseek-ai/dsh`.
+fn version_dir(version: &str) -> std::path::PathBuf {
+    dsh_home().join("versions").join(version)
+}
+
+/// The vendor package directory inside one installed version.
+fn version_pkg_dir(version: &str) -> std::path::PathBuf {
+    version_dir(version)
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+}
+
+/// dsh's `lib/bin.js` inside one installed version.
+fn version_bin_js(version: &str) -> std::path::PathBuf {
+    version_pkg_dir(version).join("lib").join("bin.js")
+}
+
+fn versions_meta_path() -> std::path::PathBuf {
+    dsh_storages_file("dsh-versions.json")
+}
+
+/// Persisted state of the version manager. Everything is optional so a missing
+/// or partially written file degrades to "no local version".
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct DshVersionsMeta {
+    /// Version the shell should run; None = use the global install.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "activeVersion")]
+    active_version: Option<String>,
+    /// Last switch time (unix seconds), for the log/UI.
+    #[serde(default, rename = "switchedAt")]
+    switched_at: u64,
+}
+
+fn read_versions_meta() -> DshVersionsMeta {
+    std::fs::read_to_string(versions_meta_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<DshVersionsMeta>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_versions_meta(meta: &DshVersionsMeta) -> Result<(), String> {
+    let path = versions_meta_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+/// The version recorded in a package's `package.json`, read as cheaply as
+/// possible: only the first 4 KB are parsed, which covers `"version"` for any
+/// npm-generated manifest. Returns None when the file is missing/unreadable.
+fn read_package_version(pkg_json: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(pkg_json).ok()?;
+    let mut buf = vec![0u8; 4096];
+    let n = file.read(&mut buf).ok()?;
+    buf.truncate(n);
+    let head = String::from_utf8_lossy(&buf);
+    let rest = head.split("\"version\"").nth(1)?;
+    let after_colon = rest.split(':').nth(1)?;
+    let after_quote = after_colon.split('"').nth(1)?;
+    let value = after_quote.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Versions installed under `<dsh home>/versions/` (newest first), each with
+/// the bin.js the shell would spawn. Directories whose package is incomplete
+/// (an interrupted install) are reported by name but marked unusable.
+fn installed_local_versions() -> Vec<(String, bool)> {
+    let root = dsh_home().join("versions");
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&root) else { return out };
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else { continue };
+        if !is_safe_version(&name) {
+            continue;
+        }
+        out.push((name.clone(), version_bin_js(&name).exists()));
+    }
+    out.sort_by(|a, b| compare_versions(&b.0, &a.0));
+    out
+}
+
+/// A version string safe to use as a single path segment and as an npm argument:
+/// digits/dots/`-`/`+`/alphanumerics only (semver), never a path separator, a
+/// drive colon, or anything npm could read as an option.
+fn is_safe_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && !version.starts_with('.')
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
+/// Semver ordering, including prereleases: `0.1.5 > 0.1.5-rc.2 >
+/// 0.1.5-rc.1 > 0.1.5-alpha.2` (the same order npm lists versions in).
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a_nums, a_pre) = parse_version_core(a);
+    let (b_nums, b_pre) = parse_version_core(b);
+    let max_len = a_nums.len().max(b_nums.len());
+    for i in 0..max_len {
+        let x = *a_nums.get(i).unwrap_or(&0);
+        let y = *b_nums.get(i).unwrap_or(&0);
+        match x.cmp(&y) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    match (a_pre, b_pre) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater, // a release outranks a prerelease
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => compare_prerelease(&x, &y),
+    }
+}
+
+/// Prerelease comparison, identifier by identifier; numeric identifiers compare
+/// numerically, and a shorter run of identifiers is lower (semver rule 11).
+fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut a_parts = a.split('.');
+    let mut b_parts = b.split('.');
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let nx = x.parse::<u64>();
+                let ny = y.parse::<u64>();
+                let ord = match (nx, ny) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Ordering::Less, // numeric < alphanumeric
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+/// The npm packument: the newest versions (installed ones always included), the
+/// dist-tags, and the browser URL for the version list.
+#[derive(serde::Serialize, Clone, Debug)]
+struct DshVersionInfo {
+    version: String,
+    /// npm dist-tags pointing at this version ("latest", "next", …).
+    tags: Vec<String>,
+    installed: bool,
+    /// True for the version the shell is currently running.
+    active: bool,
+    /// The local copy is present but its package is incomplete.
+    broken: bool,
+}
+
+/// npm registry base URL: `registryBase` in desktop-settings.json, else the
+/// public registry.
+fn npm_registry_base() -> String {
+    let base = read_desktop_settings().npm_registry;
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.starts_with("http") {
+        trimmed.to_string()
+    } else {
+        "https://registry.npmjs.org".to_string()
+    }
+}
+
+/// Fetch the version list from the npm registry. The abbreviated packument
+/// (`install-v1+json`) is what npm itself asks for: much smaller than the full
+/// document (no readme/publish dates), which keeps the request cheap.
+fn fetch_npm_versions() -> Result<(Vec<String>, serde_json::Map<String, serde_json::Value>), String> {
+    // NOTE: scoped packages are requested with the literal slash
+    // (`/@scope/name`); the registry API's `%2F` form is not a valid URL path and
+    // Node's URL/HTTP request rejects it ("Request path contains unescaped
+    // characters" / bad path errors).
+    let url = format!("{}/{}", npm_registry_base(), DSH_PACKAGE);
+    log_line(&format!("dsh versions: GET {url}"));
+    let body = http_get_with_accept(&url, "application/vnd.npm.install-v1+json")?;
+    parse_npm_packument(&body)
+}
+
+/// Extract `(versions newest first, dist-tags)` from an npm packument. Split out
+/// from the network call so the parsing and ordering can be tested offline.
+fn parse_npm_packument(
+    body: &str,
+) -> Result<(Vec<String>, serde_json::Map<String, serde_json::Value>), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("registry JSON parse failed: {e}"))?;
+    let tags = value
+        .get("dist-tags")
+        .and_then(|t| t.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut all: Vec<String> = value
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
+    if all.is_empty() {
+        return Err("registry returned no versions".into());
+    }
+    all.sort_by(|a, b| compare_versions(a, b));
+    all.reverse();
+    Ok((all, tags))
+}
+
+/// Which dsh the shell should spawn, and where that decision came from.
+struct DshResolution {
+    bin_js: std::path::PathBuf,
+    version: Option<String>,
+    source: DshSource,
+}
+
+/// Resolve `lib/bin.js` in priority order:
+///   1. `$DSH_BIN` — explicit override, always wins;
+///   2. the version recorded in `dsh-versions.json` (if its install is intact);
+///   3. the global npm install (`dsh.cmd` on PATH).
+///
+/// A recorded version whose files are missing is skipped with a log line rather
+/// than failing the launch — a deleted directory must never brick the app.
+#[cfg(target_os = "windows")]
+fn resolve_dsh_bin_js() -> std::io::Result<DshResolution> {
+    if let Ok(explicit) = std::env::var("DSH_BIN") {
+        if !explicit.is_empty() {
+            let p = std::path::PathBuf::from(&explicit);
+            if p.exists() {
+                let version = read_package_version(
+                    &p.parent().unwrap_or(&p).parent().unwrap_or(&p).join("package.json"),
+                );
+                log_line(&format!("dsh bin.js -> {} (from DSH_BIN)", p.display()));
+                return Ok(DshResolution { bin_js: p, version, source: DshSource::Env });
+            }
+            log_line(&format!(
+                "DSH_BIN set but not found: {explicit}; falling back to the version directory/global install"
+            ));
+        }
+    }
+    let meta = read_versions_meta();
+    if let Some(version) = meta.active_version.as_deref() {
+        let bin_js = version_bin_js(version);
+        if bin_js.exists() {
+            log_line(&format!(
+                "dsh bin.js -> {} (selected version {version})",
+                bin_js.display()
+            ));
+            return Ok(DshResolution {
+                bin_js,
+                version: Some(version.to_string()),
+                source: DshSource::Local,
+            });
+        }
+        log_line(&format!(
+            "dsh versions: selected version {version} is incomplete at {}; falling back to the global install",
+            bin_js.display()
+        ));
+    }
+    let shim = locate_dsh_cmd()?;
+    let dir = shim
+        .parent()
+        .ok_or_else(|| std::io::Error::other("dsh.cmd has no parent dir"))?;
+    let bin_js = dir
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("lib")
+        .join("bin.js");
+    if bin_js.exists() {
+        let version = read_package_version(&bin_js.parent().unwrap_or(&bin_js).parent().unwrap_or(&bin_js).join("package.json"));
+        Ok(DshResolution { bin_js, version, source: DshSource::Global })
+    } else {
+        Err(std::io::Error::other(format!(
+            "dsh install not found at {} — run `npm install -g @deepseek-ai/dsh`",
+            bin_js.display()
+        )))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_dsh_bin_js() -> std::io::Result<DshResolution> {
+    // `$DSH_BIN` wins here too, so a custom install behaves the same on every OS.
+    if let Ok(explicit) = std::env::var("DSH_BIN") {
+        if !explicit.is_empty() {
+            let p = std::path::PathBuf::from(&explicit);
+            if p.exists() {
+                log_line(&format!("dsh bin.js -> {} (from DSH_BIN)", p.display()));
+                return Ok(DshResolution { bin_js: p, version: None, source: DshSource::Env });
+            }
+            log_line(&format!("DSH_BIN set but not found: {explicit}"));
+        }
+    }
+    let meta = read_versions_meta();
+    if let Some(version) = meta.active_version.as_deref() {
+        let bin_js = version_bin_js(version);
+        if bin_js.exists() {
+            return Ok(DshResolution {
+                bin_js,
+                version: Some(version.to_string()),
+                source: DshSource::Local,
+            });
+        }
+        log_line(&format!(
+            "dsh versions: selected version {version} is incomplete; falling back to dsh on PATH"
+        ));
+    }
+    // No selected version: the harness runs `dsh` from PATH (see spawn_harness),
+    // so report that as the source with PATH as its location.
+    Ok(DshResolution {
+        bin_js: std::path::PathBuf::from("dsh"),
+        version: None,
+        source: DshSource::Global,
+    })
+}
+
+/// Install `version` into its own prefix (`<dsh home>/versions/<version>`).
+fn npm_install_dsh(
+    version: &str,
+    on_line: Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<(), String> {
+    if !is_safe_version(version) {
+        return Err(format!("unsafe version string: {version}"));
+    }
+    let prefix = version_dir(version);
+    // A cache inside the version prefix rather than the shared
+    // `%LOCALAPPDATA%\npm-cache`: that one can be locked by another npm or
+    // unwritable (policy, sandbox), and failing on it would break installing a
+    // version for a reason that has nothing to do with the install itself.
+    npm_install_into(&prefix, &prefix.join(".npm-cache"), version, on_line)
+}
+
+/// Run npm against an explicit prefix/cache. Split out of [`npm_install_dsh`] so
+/// the real command can be exercised in tests without touching the user's
+/// version directory.
+fn npm_install_into(
+    prefix: &std::path::Path,
+    cache: &std::path::Path,
+    version: &str,
+    on_line: Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<(), String> {
+    if !is_safe_version(version) {
+        return Err(format!("unsafe version string: {version}"));
+    }
+    std::fs::create_dir_all(prefix).map_err(|e| format!("could not create {}: {e}", prefix.display()))?;
+    let spec = format!("{DSH_PACKAGE}@{version}");
+    let args = vec![
+        "install".to_string(),
+        "--prefix".to_string(),
+        prefix.display().to_string(),
+        "--cache".to_string(),
+        cache.display().to_string(),
+        "--no-audit".to_string(),
+        "--no-fund".to_string(),
+        "--loglevel".to_string(),
+        "error".to_string(),
+        "--save-exact".to_string(),
+        spec,
+    ];
+    log_line(&format!(
+        "dsh versions: npm install --prefix {} @deepseek-ai/dsh@{version}",
+        prefix.display()
+    ));
+
+    let node = locate_node(None).map_err(|e| e.to_string())?;
+    let npm_cli = node
+        .parent()
+        .map(|dir| dir.join("node_modules").join("npm").join("bin").join("npm-cli.js"));
+    let mut cmd = match npm_cli.as_ref().filter(|p| p.exists()) {
+        Some(cli) => {
+            let mut c = Command::new(&node);
+            c.arg(cli);
+            c
+        }
+        None => {
+            let npm = if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" };
+            Command::new(npm)
+        }
+    };
+    cmd.args(&args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run npm: {e}"))?;
+
+    // Forward npm's output as it arrives so the tab can show progress, and keep a
+    // small tail for the error message. The callback is shared with the reader
+    // threads through an Arc (no borrowing across threads).
+    let tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let mut readers = Vec::new();
+    let mut pipes: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        pipes.push(Box::new(out));
+    }
+    if let Some(err) = child.stderr.take() {
+        pipes.push(Box::new(err));
+    }
+    for pipe in pipes {
+        let tail = tail.clone();
+        let on_line = on_line.clone();
+        readers.push(std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                on_line(&line);
+                let mut t = tail.lock().unwrap();
+                if t.len() >= 12 {
+                    t.pop_front();
+                }
+                t.push_back(line);
+            }
+        }));
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(NPM_INSTALL_TIMEOUT_SECS as u64);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    break Err(format!("npm install timed out after {NPM_INSTALL_TIMEOUT_SECS}s"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(e) => break Err(format!("waiting for npm failed: {e}")),
+        }
+    };
+    for r in readers {
+        let _ = r.join();
+    }
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => {
+            let msg = tail.lock().unwrap().iter().cloned().collect::<Vec<_>>().join(" | ");
+            Err(format!(
+                "npm install exited with {:?}{}",
+                s.code(),
+                if msg.is_empty() { String::new() } else { format!(": {msg}") }
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// HTTP GET with a custom `Accept` header, used for the npm registry (whose
+/// abbreviated packument is selected by `application/vnd.npm.install-v1+json`).
+/// Node is the primary route: its OpenSSL TLS works on machines where Windows'
+/// schannel/.NET stack cannot reach the host, and it needs no extra crates.
+fn http_get_with_accept(url: &str, accept: &str) -> Result<String, String> {
+    // ESM (`import`) because the script runs from a `.mjs` file, where `require`
+    // is undefined.
+    const SCRIPT: &str = r#"
+import https from 'node:https';
+const [target, accept] = process.argv.slice(2);
+const fail = (m) => { process.stderr.write(String(m) + '\n'); process.exit(1); };
+const req = https.get(target, {
+  headers: { 'User-Agent': 'deepseek-harness-desktop', 'Accept': accept },
+}, (res) => {
+  if (res.statusCode >= 400) { fail('HTTP ' + res.statusCode); return; }
+  const chunks = [];
+  res.on('data', (c) => chunks.push(c));
+  res.on('end', () => { process.stdout.write(Buffer.concat(chunks)); });
+});
+req.on('error', (e) => fail(e.message || String(e)));
+req.setTimeout(15000, () => { req.destroy(); fail('timeout after 15s'); });
+"#;
+    let body = run_node_script("node-http", SCRIPT, &[url, accept])?;
+    if body.trim().is_empty() {
+        return Err("empty response from node".into());
+    }
+    Ok(body)
+}
+
+/// A writable directory for the shell's own scratch files, tried in order:
+/// `%LOCALAPPDATA%\deepseek-harness\tmp` (the app's area, where the startup log
+/// already lives), `<dsh home>/tmp`, then TEMP. The dsh home is deliberately not
+/// first: it can be read-only for the app (policy, or a DSH_HOME the user
+/// pointed elsewhere), and a helper script must never fail for that reason.
+fn writable_tmp_dir() -> std::path::PathBuf {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    candidates.push(base.join("deepseek-harness").join("tmp"));
+    candidates.push(dsh_home().join("tmp"));
+    candidates.push(std::env::temp_dir().join("deepseek-harness"));
+    for candidate in &candidates {
+        if std::fs::create_dir_all(candidate).is_ok() {
+            return candidate.clone();
+        }
+        log_line(&format!(
+            "scratch dir not writable: {} ({:?})",
+            candidate.display(),
+            std::fs::create_dir_all(candidate).err()
+        ));
+    }
+    std::env::temp_dir()
+}
+
+/// Run a tiny node script from a real file with arguments, returning stdout.
+///
+/// The script is written to a scratch file (not passed with `-e`) because the
+/// argument offsets differ between the two forms: `node -e "…" a b` puts the
+/// arguments at `argv[1]`/`argv[2]`, while `node script.js a b` puts them at
+/// `argv[2]`/`argv[3]`. Running a file keeps one contract and matches the usage
+/// sidecar, the only other node child.
+fn run_node_script(name: &str, script: &str, args: &[&str]) -> Result<String, String> {
+    let node = locate_node(None).map_err(|e| e.to_string())?;
+    let dir = writable_tmp_dir();
+    // Unique per call: two concurrent invocations (or an install) must not clobber
+    // each other's script file.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let script_path = dir.join(format!("{name}-{stamp}.mjs"));
+    std::fs::write(&script_path, script)
+        .map_err(|e| format!("could not write {}: {e}", script_path.display()))?;
+
+    let mut cmd = Command::new(node);
+    cmd.arg(&script_path);
+    cmd.args(args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output();
+    let _ = std::fs::remove_file(&script_path);
+    let out = out.map_err(|e| format!("could not run node: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        // Prefer a line that actually names the failure: node prints a module
+        // stack whose HEAD is "node:internal/..." (useless), with the real
+        // `TypeError:`/`HTTP 404` further down.
+        let best = err
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .find(|l| l.contains("Error") || l.contains("HTTP ") || l.contains("timeout"))
+            .or_else(|| err.lines().map(|l| l.trim()).find(|l| !l.is_empty()))
+            .unwrap_or("");
+        return Err(if best.is_empty() {
+            format!("node exited with {:?}", out.status.code())
+        } else {
+            // One line keeps the log and the tab readable.
+            best.to_string()
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Build the payload the usage dialog's "dsh 版本" tab renders: which dsh the
+/// shell is running, what is installed in the version directory, and which
+/// versions npm publishes.
+fn build_versions_payload(include_registry: bool) -> serde_json::Value {
+    let resolution = resolve_dsh_bin_js().ok();
+    let active_version = resolution.as_ref().and_then(|r| r.version.clone());
+    let source = resolution.as_ref().map(|r| r.source).unwrap_or(DshSource::Global);
+    if let Some(r) = resolution.as_ref() {
+        if r.version.is_none() {
+            log_line(&format!(
+                "dsh versions: could not read the version of {}",
+                r.bin_js.display()
+            ));
+        }
+    }
+    let installed = installed_local_versions();
+    let meta = read_versions_meta();
+
+    // Registry data is optional: when the registry is unreachable the tab still
+    // shows the current/installed state, with the error attached for the user.
+    let mut registry_error: Option<String> = None;
+    let mut registry_versions: Vec<String> = Vec::new();
+    let mut tags = serde_json::Map::new();
+    if include_registry {
+        match fetch_npm_versions() {
+            Ok((list, t)) => {
+                registry_versions = list;
+                tags = t;
+            }
+            Err(e) => {
+                log_line(&format!("dsh versions: registry fetch failed: {e}"));
+                registry_error = Some(e);
+            }
+        }
+    }
+
+    let installed_names: Vec<String> = installed.iter().map(|(v, _)| v.clone()).collect();
+    let broken_names: Vec<String> = installed
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(v, _)| v.clone())
+        .collect();
+    // Newest N from the registry, plus the active/installed versions, so the ones
+    // that matter are always visible.
+    let mut shown: Vec<String> = registry_versions.iter().take(VERSION_LIST_LIMIT).cloned().collect();
+    for extra in meta.active_version.iter().chain(installed_names.iter()) {
+        if !shown.contains(extra) {
+            shown.push(extra.clone());
+        }
+    }
+    let mut entries: Vec<DshVersionInfo> = Vec::new();
+    for version in shown {
+        if !registry_versions.contains(&version) && !installed_names.contains(&version) {
+            continue;
+        }
+        let mut tags_for_version: Vec<String> = tags
+            .iter()
+            .filter(|(_, v)| v.as_str() == Some(version.as_str()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        tags_for_version.sort();
+        entries.push(DshVersionInfo {
+            installed: installed_names.contains(&version),
+            broken: broken_names.contains(&version),
+            active: source == DshSource::Local && active_version.as_deref() == Some(version.as_str()),
+            version,
+            tags: tags_for_version,
+        });
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "source": source,
+        "sourceLabel": source.label(),
+        "activeVersion": active_version,
+        "activePath": resolution.as_ref().map(|r| r.bin_js.display().to_string()),
+        "installed": installed.iter().map(|(v, ok)| serde_json::json!({
+            "version": v,
+            "complete": ok,
+            "active": active_version.as_deref() == Some(v.as_str()),
+        })).collect::<Vec<_>>(),
+        "versions": entries,
+        "registryBase": npm_registry_base(),
+        "registryError": registry_error,
+        "versionsRoot": dsh_home().join("versions").display().to_string(),
+        "limit": VERSION_LIST_LIMIT,
+    })
 }
 
 /// True when this build is the standalone (免安装) exe rather than an installed
@@ -2534,6 +3213,247 @@ fn main() {
                 });
             }
 
+            // ── dsh version manager (usage dialog → "dsh 版本" tab) ────────────
+            // Same event-IPC pattern as the pricing config: the page emits, this
+            // replies with an event, because invoking commands from the remote
+            // harness page is not ACL-allowed by default.
+            {
+                // Listing touches the network (npm registry), so it runs off the
+                // event loop; the tab renders the cached-ish result when it comes.
+                let list_app = app.handle().clone();
+                app.handle().listen("dsh-versions-list", move |_e| {
+                    let app_for_thread = list_app.clone();
+                    std::thread::spawn(move || {
+                        let payload = build_versions_payload(true);
+                        let _ = app_for_thread.emit("dsh-versions-data", payload);
+                    });
+                });
+
+                // Install one version into its own prefix, streaming npm output.
+                let install_app = app.handle().clone();
+                app.handle().listen("dsh-versions-install", move |event| {
+                    let payload_str = event.payload().to_string();
+                    let version = unwrap_event_payload(&payload_str)
+                        .as_ref()
+                        .and_then(|v| v.as_object())
+                        .and_then(|o| o.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                        .or_else(|| {
+                            unwrap_event_payload(&payload_str)
+                                .as_ref()
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
+                    let Some(version) = version else {
+                        log_line(&format!(
+                            "dsh versions: install requested without a usable version: {payload_str}"
+                        ));
+                        return;
+                    };
+                    if !is_safe_version(&version) {
+                        log_line(&format!("dsh versions: refused unsafe version {version}"));
+                        let _ = install_app.emit(
+                            "dsh-versions-install-result",
+                            serde_json::json!({ "ok": false, "version": version, "error": "版本号不合法" }),
+                        );
+                        return;
+                    }
+                    log_line(&format!("dsh versions: install requested for {version}"));
+                    let app_for_thread = install_app.clone();
+                    std::thread::spawn(move || {
+                        let _ = app_for_thread.emit(
+                            "dsh-versions-install-result",
+                            serde_json::json!({ "ok": true, "state": "started", "version": version }),
+                        );
+                        let progress_app = app_for_thread.clone();
+                        let progress_version = version.clone();
+                        let on_line = Arc::new(move |line: &str| {
+                            let _ = progress_app.emit(
+                                "dsh-versions-install-progress",
+                                serde_json::json!({ "version": progress_version, "line": line }),
+                            );
+                        });
+                        let result = npm_install_dsh(&version, on_line);
+                        let payload = match &result {
+                            Ok(()) => {
+                                log_line(&format!("dsh versions: {version} installed"));
+                                // Installing a version implicitly selects it: the
+                                // user asked for it, and the switch only takes
+                                // effect on the next launch anyway.
+                                let meta = DshVersionsMeta {
+                                    active_version: Some(version.clone()),
+                                    switched_at: unix_now(),
+                                };
+                                match write_versions_meta(&meta) {
+                                    Ok(()) => serde_json::json!({
+                                        "ok": true,
+                                        "state": "done",
+                                        "version": version,
+                                        "activeVersion": version,
+                                        "message": "安装完成，重启应用后生效",
+                                    }),
+                                    Err(e) => {
+                                        log_line(&format!("dsh versions: could not select {version}: {e}"));
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "version": version,
+                                            "error": format!("安装完成但写入选择失败：{e}"),
+                                        })
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log_line(&format!("dsh versions: install {version} failed: {e}"));
+                                serde_json::json!({ "ok": false, "version": version, "error": e })
+                            }
+                        };
+                        let _ = app_for_thread.emit("dsh-versions-install-result", payload);
+                    });
+                });
+
+                // Select an already installed version (or the global install).
+                let switch_app = app.handle().clone();
+                app.handle().listen("dsh-versions-switch", move |event| {
+                    let payload_str = event.payload().to_string();
+                    let obj = unwrap_event_payload(&payload_str);
+                    let obj = obj.as_ref().and_then(|v| v.as_object());
+                    let version = obj
+                        .and_then(|o| o.get("version"))
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                    let use_global = obj
+                        .and_then(|o| o.get("global"))
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    let result = (|| -> Result<String, String> {
+                        if use_global || version.is_none() {
+                            let meta = DshVersionsMeta {
+                                active_version: None,
+                                switched_at: unix_now(),
+                            };
+                            write_versions_meta(&meta)?;
+                            return Ok("已切换回全局安装".to_string());
+                        }
+                        let version = version.unwrap();
+                        if !is_safe_version(&version) {
+                            return Err(format!("版本号不合法：{version}"));
+                        }
+                        if !version_bin_js(&version).exists() {
+                            return Err(format!("本地没有 {version} 的完整安装，请先安装"));
+                        }
+                        let meta = DshVersionsMeta {
+                            active_version: Some(version.clone()),
+                            switched_at: unix_now(),
+                        };
+                        write_versions_meta(&meta)?;
+                        Ok(format!("已选择 {version}"))
+                    })();
+                    match result {
+                        Ok(message) => {
+                            log_line(&format!("dsh versions: {message}（重启后生效）"));
+                            let _ = switch_app.emit(
+                                "dsh-versions-switch-result",
+                                serde_json::json!({ "ok": true, "message": message }),
+                            );
+                        }
+                        Err(e) => {
+                            log_line(&format!("dsh versions: switch failed: {e}"));
+                            let _ = switch_app.emit(
+                                "dsh-versions-switch-result",
+                                serde_json::json!({ "ok": false, "error": e }),
+                            );
+                        }
+                    }
+                });
+
+                // Remove a locally installed version (never the running one).
+                let remove_app = app.handle().clone();
+                app.handle().listen("dsh-versions-remove", move |event| {
+                    let payload_str = event.payload().to_string();
+                    let version = unwrap_event_payload(&payload_str)
+                        .as_ref()
+                        .and_then(|v| v.as_object())
+                        .and_then(|o| o.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()));
+                    let result = (|| -> Result<String, String> {
+                        let version = version.ok_or_else(|| "缺少版本号".to_string())?;
+                        if !is_safe_version(&version) {
+                            return Err(format!("版本号不合法：{version}"));
+                        }
+                        if read_versions_meta().active_version.as_deref() == Some(version.as_str()) {
+                            return Err("这是当前选中的版本，请先切换到其他版本".to_string());
+                        }
+                        let dir = version_dir(&version);
+                        if !dir.exists() {
+                            return Err(format!("{version} 未安装在版本目录中"));
+                        }
+                        std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败：{e}"))?;
+                        Ok(format!("已删除 {version}"))
+                    })();
+                    match result {
+                        Ok(message) => {
+                            log_line(&format!("dsh versions: {message}"));
+                            let _ = remove_app.emit(
+                                "dsh-versions-remove-result",
+                                serde_json::json!({ "ok": true, "message": message }),
+                            );
+                        }
+                        Err(e) => {
+                            log_line(&format!("dsh versions: remove failed: {e}"));
+                            let _ = remove_app.emit(
+                                "dsh-versions-remove-result",
+                                serde_json::json!({ "ok": false, "error": e }),
+                            );
+                        }
+                    }
+                });
+
+                // Restart the shell so the newly selected dsh is spawned. Same
+                // mechanism as the WebView2 recovery path: a fresh process, then
+                // exit this one — but only after the harness tree is killed, so no
+                // orphaned dsh keeps the port/browser session.
+                let restart_app = app.handle().clone();
+                app.handle().listen("dsh-app-restart", move |_e| {
+                    log_line("app restart requested by the dsh version tab");
+                    let app = restart_app.clone();
+                    std::thread::spawn(move || {
+                        {
+                            let state = app.state::<Arc<HarnessState>>();
+                            let pid = *state.pid.lock().unwrap();
+                            log_line(&format!("restart: killing harness pid={pid:?}"));
+                            kill_tree(pid);
+                            let usage_state = app.state::<Arc<UsageState>>();
+                            let usage_pid = *usage_state.pid.lock().unwrap();
+                            kill_tree(usage_pid);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let exe = match std::env::current_exe() {
+                            Ok(exe) => exe,
+                            Err(e) => {
+                                log_line(&format!("restart: current_exe failed: {e}"));
+                                return;
+                            }
+                        };
+                        match std::process::Command::new(&exe)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        {
+                            Ok(child) => log_line(&format!(
+                                "restart: relaunched {} pid={}",
+                                exe.display(),
+                                child.id()
+                            )),
+                            Err(e) => {
+                                log_line(&format!("restart: relaunch failed: {e}"));
+                                return;
+                            }
+                        }
+                        log_line("restart: exiting the old instance");
+                        std::process::exit(0);
+                    });
+                });
+            }
+
             // GitHub update check: once per launch (every launch, no interval
             // config — the HTML endpoint is quota-free so checking is cheap),
             // silent failure. Runs in parallel with dsh spawn; all errors only
@@ -3135,6 +4055,247 @@ mod update_download_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[test]
+    fn safe_version_strings_only() {
+        // Real semver shapes are accepted.
+        for ok in ["0.1.5", "0.1.5-rc.1", "1.0.0-alpha.2+build.7", "0.1.18"] {
+            assert!(is_safe_version(ok), "{ok} should be accepted");
+        }
+        // Anything that could escape the versions dir or be read as an npm flag
+        // is refused before it reaches a path or a command line.
+        for bad in [
+            "",
+            "..",
+            "../evil",
+            "..\\evil",
+            "C:\\x",
+            "/etc/passwd",
+            "--force",
+            "-g",
+            ".hidden",
+            "v0.1.5",
+            "0.1.5; rm -rf /",
+            "0.1.5 0.2.0",
+            "0.1.5 && echo",
+        ] {
+            assert!(!is_safe_version(bad), "{bad:?} must be refused");
+        }
+        // Long strings are refused too (a 64-char cap keeps names sane).
+        assert!(!is_safe_version(&format!("1.{}", "0".repeat(80))));
+    }
+
+    #[test]
+    fn semver_ordering_handles_prereleases() {
+        use std::cmp::Ordering;
+        // The order npm lists versions in.
+        assert_eq!(compare_versions("0.1.5", "0.1.5-rc.2"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.5-rc.2", "0.1.5-rc.1"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.5-rc.1", "0.1.5-alpha.2"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.5-alpha.2", "0.1.5-alpha.1"), Ordering::Greater);
+        assert_eq!(compare_versions("0.1.3", "0.1.2"), Ordering::Greater);
+        assert_eq!(compare_versions("0.2.0", "0.10.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
+        // Numeric prerelease identifiers compare numerically, not lexically.
+        assert_eq!(compare_versions("1.0.0-rc.9", "1.0.0-rc.10"), Ordering::Less);
+        // A release outranks its prereleases, even a higher-numbered one.
+        assert_eq!(compare_versions("1.0.0", "1.0.0-rc.99"), Ordering::Greater);
+    }
+
+    #[test]
+    fn packument_parsing_sorts_newest_first() {
+        // Shape of the abbreviated npm packument (install-v1+json).
+        let body = r#"{
+          "name": "@deepseek-ai/dsh",
+          "dist-tags": { "latest": "0.1.5-rc.1", "next": "0.1.5-rc.2", "alpha": "0.1.5-alpha.2" },
+          "versions": {
+            "0.1.2-alpha.4": { "name": "@deepseek-ai/dsh" },
+            "0.1.5-rc.1": { "name": "@deepseek-ai/dsh" },
+            "0.1.5": { "name": "@deepseek-ai/dsh" },
+            "0.1.5-alpha.2": { "name": "@deepseek-ai/dsh" },
+            "0.1.5-rc.2": { "name": "@deepseek-ai/dsh" }
+          }
+        }"#;
+        let (versions, tags) = parse_npm_packument(body).unwrap();
+        assert_eq!(
+            versions,
+            vec!["0.1.5", "0.1.5-rc.2", "0.1.5-rc.1", "0.1.5-alpha.2", "0.1.2-alpha.4"]
+        );
+        assert_eq!(tags.get("latest").and_then(|v| v.as_str()), Some("0.1.5-rc.1"));
+        // Garbage and empty packuments are errors, not panics or empty lists.
+        assert!(parse_npm_packument("not json").is_err());
+        assert!(parse_npm_packument("{}").is_err());
+        assert!(parse_npm_packument(r#"{"versions":{}}"#).is_err());
+    }
+
+    #[test]
+    fn package_version_is_read_from_a_manifest_head() {
+        let dir = std::env::temp_dir().join("dsh-version-read-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pkg = dir.join("package.json");
+        std::fs::write(
+            &pkg,
+            "{\n  \"name\": \"@deepseek-ai/dsh\",\n  \"version\": \"0.1.5-rc.1\",\n  \"bin\": {}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(read_package_version(&pkg).as_deref(), Some("0.1.5-rc.1"));
+        // Missing file: None, never a panic (a half-deleted version must not
+        // break the tab or the launch).
+        assert_eq!(read_package_version(&dir.join("nope.json")), None);
+        // A manifest without a version field is also None.
+        let other = dir.join("other.json");
+        std::fs::write(&other, "{\"name\":\"x\"}").unwrap();
+        assert_eq!(read_package_version(&other), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live registry check. Skipped (with a message) when the registry is
+    /// unreachable, so an offline machine or CI cannot fail the suite.
+    #[test]
+    fn npm_registry_is_reachable_and_parsable() {
+        let url = format!("{}/{}", DEFAULT_NPM_REGISTRY, DSH_PACKAGE);
+        let body = match http_get_with_accept(&url, "application/vnd.npm.install-v1+json") {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("SKIP: npm registry unreachable ({e})");
+                return;
+            }
+        };
+        let (versions, tags) = parse_npm_packument(&body).expect("live packument must parse");
+        assert!(!versions.is_empty());
+        assert!(
+            versions.windows(2).all(|w| compare_versions(&w[0], &w[1]) != std::cmp::Ordering::Less),
+            "versions must be newest-first: {:?}",
+            &versions[..versions.len().min(5)]
+        );
+        assert!(tags.contains_key("latest"));
+        eprintln!(
+            "registry ok: {} versions, newest {:?}, latest tag {:?}",
+            versions.len(),
+            &versions[..versions.len().min(3)],
+            tags.get("latest").and_then(|v| v.as_str())
+        );
+    }
+
+    /// The node fetch routes must really pass the URL as the URL. A mistake here
+    /// (e.g. reading the wrong argv slot, or passing `-e` args that start one
+    /// index earlier) silently sends a different string as the request target and
+    /// every caller fails with "Invalid URL" — so exercise both helpers live.
+    #[test]
+    fn node_fetch_routes_send_the_url_they_are_given() {
+        // A scoped package that does not exist: reaching the registry at all
+        // proves the URL was used, and the error must be the registry's 404.
+        let err = http_get_with_accept(
+            &format!("{}/@deepseek-ai/dsh-nonexistent-probe", DEFAULT_NPM_REGISTRY),
+            "application/json",
+        )
+        .err();
+        match err {
+            Some(e) => {
+                assert!(
+                    !e.contains("Invalid URL") && !e.contains("ERR_INVALID_URL"),
+                    "url must reach node, not be swapped with another argument: {e}"
+                );
+                assert!(e.contains("HTTP"), "expected an HTTP status error, got: {e}");
+            }
+            None => eprintln!("SKIP: registry answered 2xx for the probe package; nothing to assert"),
+        }
+
+        // node_get: an HTML 404 page is an error, an existing API path is not —
+        // either way the failure must not be an argv mix-up.
+        match node_get("https://api.github.com/repos/ai-written/DeepSeek-Harness") {
+            Ok(body) => assert!(body.contains("\"full_name\"") || body.contains("DeepSeek-Harness")),
+            Err(e) => {
+                assert!(
+                    !e.contains("Invalid URL") && !e.contains("ERR_INVALID_URL"),
+                    "node_get must pass the URL as argv[2]: {e}"
+                );
+                eprintln!("SKIP: github api unreachable ({e})");
+            }
+        }
+    }
+
+    /// Real `npm install --prefix` into a temporary prefix: proves the command,
+    /// the flag set and the resulting layout, which is what "安装" actually does.
+    ///
+    /// Opt-in (`DSH_TEST_NPM_INSTALL=1`) because it downloads the whole package
+    /// tree: it takes ~1-2 minutes, so a normal `cargo test` must not pay for it.
+    /// Skips itself when npm or the registry is unavailable.
+    #[test]
+    fn npm_install_into_creates_a_runnable_version_tree() {
+        if std::env::var("DSH_TEST_NPM_INSTALL").as_deref() != Ok("1") {
+            eprintln!("SKIP: set DSH_TEST_NPM_INSTALL=1 to run the real npm install test");
+            return;
+        }
+        let version = "0.1.5-rc.1";
+        let base = std::env::temp_dir().join("dsh-version-install-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let prefix = base.join("prefix");
+        let cache = base.join("cache");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_cb = seen.clone();
+        let on_line: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |line: &str| {
+            seen_for_cb.lock().unwrap().push(line.to_string());
+        });
+        let result = npm_install_into(&prefix, &cache, version, on_line);
+        let bin_js = prefix
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("lib")
+            .join("bin.js");
+        match result {
+            Ok(()) => {
+                assert!(bin_js.exists(), "bin.js missing after install: {}", bin_js.display());
+                assert_eq!(
+                    read_package_version(&bin_js.join("..").join("package.json")).as_deref(),
+                    Some(version)
+                );
+                eprintln!("install ok: npm forwarded {} output line(s)", seen.lock().unwrap().len());
+            }
+            Err(e) => eprintln!("SKIP: npm install unavailable here ({e})"),
+        }
+        // An invalid version is refused before npm is ever started.
+        let bad = npm_install_into(
+            &prefix,
+            &cache,
+            "0.1.5; rm -rf /",
+            Arc::new(|_: &str| {}) as Arc<dyn Fn(&str) + Send + Sync>,
+        );
+        assert!(bad.is_err(), "unsafe version must be refused");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The payload the tab renders must be produced without touching the network
+    /// (`include_registry = false`) and must always carry the running/installed
+    /// state — this is the path used when npm's registry is unreachable.
+    #[test]
+    fn versions_payload_works_without_the_registry() {
+        let payload = build_versions_payload(false);
+        assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+        for key in [
+            "source",
+            "sourceLabel",
+            "activeVersion",
+            "activePath",
+            "installed",
+            "versions",
+            "registryBase",
+            "registryError",
+            "versionsRoot",
+        ] {
+            assert!(payload.get(key).is_some(), "payload is missing {key}");
+        }
+        assert!(payload.get("installed").unwrap().is_array());
+        assert!(payload.get("versions").unwrap().is_array());
+        // The source is one of the three known origins (never absent).
+        let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            ["env", "local", "global"].contains(&source),
+            "unexpected source label: {source}"
+        );
+    }
 
     #[test]
     fn existing_downloads_are_never_clobbered() {
