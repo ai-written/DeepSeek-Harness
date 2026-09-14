@@ -234,15 +234,99 @@
   // before the DOM is ready, so remember the latest message and replay it on
   // mount.
   let lastStartup = null
+  // True once dsh reported ready: from then on the recovery controls are hidden
+  // (the normal dialog is reachable from the badge).
+  let serviceReady = false
   if (Tauri.event) {
     Tauri.event
       .listen('dsh-startup', (e) => {
         const ev = e.payload || {}
         const msg = typeof ev === 'string' ? { level: 'info', message: ev } : ev
         lastStartup = msg
+        if (msg.stage === 'ready') serviceReady = true
         applyStartup(msg)
       })
       .catch(() => {})
+  }
+
+  // ── recovery controls (startup page only) ───────────────────────────────────
+  // Visible while booting and after a failure; the container id keeps it off the
+  // harness page (window-controls.js runs there too).
+  function showRecoveryControls(visible) {
+    const panel = document.getElementById('startup-panel')
+    if (!panel) return
+    let box = document.getElementById('dsh-recovery')
+    if (!visible) {
+      if (box) box.style.display = 'none'
+      return
+    }
+    if (!box) {
+      box = document.createElement('div')
+      box.id = 'dsh-recovery'
+      box.style.cssText =
+        'display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px;'
+
+      const mkBtn = (text, primary, onclick) => {
+        const b = document.createElement('button')
+        b.type = 'button'
+        b.textContent = text
+        b.style.cssText =
+          'padding:7px 14px;border-radius:9px;font-size:12.5px;font-weight:600;cursor:pointer;' +
+          'font-family:inherit;' +
+          (primary
+            ? 'border:none;background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;'
+            : 'border:1px solid #d0d7de;background:#fff;color:#24292f;')
+        b.onclick = onclick
+        return b
+      }
+
+      // Straight to the version dialog: switch back to a version that starts.
+      box.appendChild(
+        mkBtn('切换 dsh 版本', true, () => {
+          if (typeof window.__deepseekHarnessOpenVersions === 'function') {
+            window.__deepseekHarnessOpenVersions()
+          } else {
+            // The panel script could not load (or the badge was disabled): at least
+            // put the version directory on screen so the user can act manually.
+            emit('dsh-reveal-versions-dir', {})
+          }
+        }),
+      )
+      // Retry without restarting: cheap, and enough when the failure was
+      // transient (a cold-start timeout, a port clash, an antivirus delay).
+      box.appendChild(
+        mkBtn('重试启动', false, () => {
+          const status = document.getElementById('dsh-startup-status')
+          if (status) {
+            status.textContent = '正在重试启动 dsh…'
+            status.className = 'status'
+          }
+          emit('dsh-retry-start', {})
+        }),
+      )
+      box.appendChild(mkBtn('打开日志', false, () => emit('dsh-open-startup-log', {})))
+
+      const hint = document.createElement('div')
+      hint.style.cssText = 'width:100%;font-size:11.5px;color:#8b949e;text-align:center;'
+      hint.textContent = '切换版本后可在此重试启动，或点版本对话框里的「重启应用」。'
+      box.appendChild(hint)
+
+      const insertAfter = document.getElementById('dsh-startup-status') || panel.lastElementChild
+      if (insertAfter && insertAfter.parentNode === panel) {
+        panel.insertBefore(box, insertAfter.nextSibling)
+      } else {
+        panel.appendChild(box)
+      }
+    }
+    box.style.display = 'flex'
+  }
+
+  function emit(name, payload) {
+    try {
+      if (Tauri.event && Tauri.event.emit) Tauri.event.emit(name, payload).catch(() => {})
+    } catch {
+      /* noop */
+    }
   }
 
   // Map of startup stages (sent by main.rs) to step indices. Falls back to
@@ -271,6 +355,12 @@
 
     const panel = document.getElementById('startup-panel')
     if (panel) panel.classList.toggle('has-error', isError)
+    // Recovery controls: shown while the shell is still booting and kept on
+    // screen after a failure. A selected dsh version that cannot start is the one
+    // failure with no in-page escape otherwise — the harness page (and with it
+    // the version tab and the usage dialog) is never reached, which would leave
+    // hand-editing dsh-versions.json as the only way back.
+    showRecoveryControls(isError || !serviceReady)
 
     const steps = document.getElementById('startup-steps')
     if (!steps) return

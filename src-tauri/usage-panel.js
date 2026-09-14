@@ -419,6 +419,15 @@
     modalContent.innerHTML = ''
     const payload = modalPayload || lastPayload || {}
     const recent = Array.isArray(payload.recent) ? payload.recent : []
+    // No payload at all: only reachable from the startup page's recovery entry
+    // (dsh never started, so no sidecar data exists). Say so plainly instead of
+    // drawing an empty chart.
+    if (!modalPayload && !lastPayload) {
+      modalContent.appendChild(
+        emptyBox('没有用量数据（dsh 未启动时无法统计数据）。请用「dsh 版本」页签切换或重启。'),
+      )
+      return
+    }
     // The sidecar's amount fields are in the configured total currency; only
     // USD totals need the exchange rate to be displayed in ¥.
     const rate = payload.totalCurrency === 'cny' ? 1 : payload.exchangeRate || 7.2
@@ -1522,7 +1531,7 @@
     }
   }
 
-  function openModal() {
+  function openModal(options) {
     // Freeze the usage data at the moment the dialog opens. The sidecar keeps
     // running for the badge while closed, but its polling loop is paused until
     // this snapshot is dismissed.
@@ -1532,7 +1541,7 @@
     } catch {}
     const m = buildModal()
     m.style.display = 'flex'
-    selectTab('chart')
+    selectTab((options && options.tab) || 'chart')
   }
 
   // Form tab: seed from the last known/saved config, then reconcile with the
@@ -1584,6 +1593,34 @@
   function mount() {
     if (lastPayload) show()
   }
+
+  // Recovery entry point for the startup page. When dsh fails to start (a bad
+  // version, a broken install), the harness page is never reached — so the badge
+  // never appears and the version tab would be unreachable exactly when it is
+  // needed to switch back. window-controls.js calls this on the startup error,
+  // and the dialog opens straight on "dsh 版本".
+  window.__deepseekHarnessOpenVersions = function openVersionsPanel() {
+    try {
+      openModal({ tab: 'versions' })
+      return true
+    } catch (err) {
+      console.warn('[deepseek-harness] could not open the version panel:', err)
+      return false
+    }
+  }
+  // Also usable from the dsh page: a plain entry to the same dialog.
+  window.__deepseekHarnessOpenUsage = function openUsagePanel() {
+    try {
+      openModal({ tab: 'chart' })
+      return true
+    } catch {
+      return false
+    }
+  }
+  // The dialog must be openable without any usage data: on the startup page there
+  // is no sidecar payload, and the version/pricing tabs do not need one. An empty
+  // payload keeps the chart tab from rendering stale "no data" state.
+  window.__deepseekHarnessHasUsagePanel = true
 
   if (Tauri.event) {
     Tauri.event

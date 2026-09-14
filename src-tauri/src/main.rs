@@ -2987,19 +2987,37 @@ fn unblock_file(path: &std::path::Path) {
 fn unblock_file(_path: &std::path::Path) {}
 
 /// Show the downloaded file in the file manager, selected.
+///
+/// Also used for the log: for a text file the Explorer association may ignore
+/// `/select`, so when the file has an extension whose default handler opens it
+/// (a `.log`), launching the shell's `start` is a better second try than showing
+/// the folder again.
 fn reveal_in_file_manager(path: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         // The `/select,` switch must not be quoted on its own; the whole
         // argument is quoted as one unit so a path with spaces survives.
         let arg = format!("/select,\"{}\"", path.display());
-        match Command::new("explorer").arg(&arg).spawn() {
-            Ok(_) => return,
-            Err(e) => {
-                log_line(&format!("update download: explorer /select failed ({e}); opening the folder"));
-                if let Some(dir) = path.parent() {
-                    let _ = Command::new("explorer").arg(dir).spawn();
-                }
+        if let Err(e) = Command::new("explorer").arg(&arg).spawn() {
+            log_line(&format!("update download: explorer /select failed ({e}); opening the folder"));
+            if let Some(dir) = path.parent() {
+                let _ = Command::new("explorer").arg(dir).spawn();
+            }
+        }
+        // Text artifacts (startup.log) are meant to be READ: `start` hands them to
+        // the default handler, which is what the user asked for by pressing 打开日志.
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "log" | "txt" | "json"))
+        {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "start", "", &path.display().to_string()]);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            if let Err(e) = cmd.spawn() {
+                log_line(&format!("could not open {} with its default handler: {e}", path.display()));
             }
         }
     }
@@ -3271,6 +3289,92 @@ fn pricing_write(pricing: &str) -> String {
         Ok(()) => "ok".to_string(),
         Err(e) => e.to_string(),
     }
+}
+
+/// Spawn dsh, wait for its URL and navigate the window — the whole launch, on its
+/// own thread. Used for the initial start and for the error page's 重试启动.
+///
+/// `attempts` counts launches so a stale attempt (the first one timing out while
+/// the user already retried) cannot overwrite the current state or navigate the
+/// window after a newer attempt succeeded.
+fn start_harness(
+    app: &tauri::AppHandle,
+    state: Arc<HarnessState>,
+    attempts: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        log_line(&format!("background thread started: spawning dsh (attempt {attempt})…"));
+        emit_startup(&handle, "info", "locate", "正在定位 dsh 并启动（首次开机冷启动可能较慢）…");
+        let result = (|| -> Result<String, String> {
+            // A retry may run while the previous child is still alive (e.g. the
+            // first attempt is stuck waiting for its ready line): never leave two
+            // dsh trees on one DSH_HOME, which the README warns corrupts sessions.
+            {
+                let mut child_slot = state.child.lock().unwrap();
+                if let Some(mut old) = child_slot.take() {
+                    log_line("start_harness: killing the previous harness child before retrying");
+                    let _ = old.kill();
+                }
+            }
+            let previous_pid = *state.pid.lock().unwrap();
+            if previous_pid.is_some() {
+                kill_tree(previous_pid);
+                *state.pid.lock().unwrap() = None;
+            }
+
+            let child = spawn_harness().map_err(|e| {
+                let msg = format!(
+                    "未找到 dsh：{e}。请先安装 Node >= 22 并全局安装：npm install -g @deepseek-ai/dsh \
+                     （或设置 DSH_BIN 指向 dsh 的 lib/bin.js 绝对路径）"
+                );
+                log_line(&format!("spawn_harness failed: {msg}"));
+                msg
+            })?;
+            let pid = child.id();
+            *state.pid.lock().unwrap() = Some(pid);
+            *state.child.lock().unwrap() = Some(child);
+            log_line(&format!("child stored pid={pid}; waiting for ready URL"));
+            emit_startup(&handle, "info", "wait", "dsh 已启动，等待服务就绪…");
+            read_ready_url(state.child.lock().unwrap().as_mut().unwrap())
+        })();
+
+        let current = attempts.load(std::sync::atomic::Ordering::SeqCst) > attempt;
+        if current {
+            log_line(&format!(
+                "start_harness: attempt {attempt} finished after a newer attempt started; ignoring its result"
+            ));
+            return;
+        }
+
+        match result {
+            Ok(url) => {
+                log_line(&format!("harness ready: {url}; navigating"));
+                emit_startup(&handle, "info", "ready", "服务已就绪，正在加载界面…");
+                if let Some(window) = handle.get_webview_window("main") {
+                    match window.navigate(url.parse().expect("loopback url")) {
+                        Ok(()) => log_line("window.navigate() accepted"),
+                        Err(e) => log_line(&format!("ERROR: window.navigate failed: {e}")),
+                    }
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    log_line("window navigated & shown");
+                } else {
+                    log_line("ERROR: main window not found");
+                }
+            }
+            Err(msg) => {
+                log_line(&format!("startup failed: {msg}"));
+                kill_tree(*state.pid.lock().unwrap());
+                // Keep the window open with the reason on the placeholder page
+                // (styled as an error) instead of a silent exit — the page offers
+                // 切换 dsh 版本 / 重试启动 / 打开日志, and the titlebar X still runs
+                // the cleanup path.
+                emit_startup(&handle, "error", "error", format!("{msg}\n\n详细日志：{}", log_path().display()));
+            }
+        }
+    });
 }
 
 fn main() {
@@ -3612,6 +3716,44 @@ fn main() {
                         std::process::exit(0);
                     });
                 });
+
+                // "打开日志" on the startup page: the page cannot open files, and
+                // the previous behaviour was to print `%LOCALAPPDATA%\...\startup.log`
+                // as text and let the user find it. Opening it (folder + reveal)
+                // is the difference between reading the reason for a failed start
+                // and giving up.
+                let log_app = app.handle().clone();
+                app.handle().listen("dsh-open-startup-log", move |_e| {
+                    let path = log_path();
+                    log_line(&format!(
+                        "startup log requested by the page -> {} (exists: {})",
+                        path.display(),
+                        path.exists()
+                    ));
+                    if path.exists() {
+                        reveal_in_file_manager(&path);
+                    } else if let Some(dir) = path.parent() {
+                        let _ = Command::new("explorer").arg(dir).spawn();
+                    }
+                    let _ = log_app.emit(
+                        "dsh-open-startup-log-done",
+                        serde_json::json!({ "path": path.display().to_string() }),
+                    );
+                });
+
+                // Fallback for "切换 dsh 版本" when the panel script is unavailable:
+                // show the version directory (and log its path in the reply).
+                let reveal_app = app.handle().clone();
+                app.handle().listen("dsh-reveal-versions-dir", move |_e| {
+                    let dir = dsh_home().join("versions");
+                    let _ = std::fs::create_dir_all(&dir);
+                    log_line(&format!("dsh versions dir revealed -> {}", dir.display()));
+                    reveal_in_file_manager(&dir);
+                    let _ = reveal_app.emit(
+                        "dsh-reveal-versions-dir-done",
+                        serde_json::json!({ "path": dir.display().to_string() }),
+                    );
+                });
             }
 
             // GitHub update check: once per launch (every launch, no interval
@@ -3910,55 +4052,35 @@ fn main() {
             // then navigate the main window to it. Every stage is forwarded to
             // the placeholder page as a `dsh-startup` event so the user sees
             // progress while the cold (post-boot) spawn chain runs.
-            let handle = app.handle().clone();
-            let state_for_thread = state.clone();
-            std::thread::spawn(move || {
-                log_line("background thread started: spawning dsh…");
-                emit_startup(&handle, "info", "locate", "正在定位 dsh 并启动（首次开机冷启动可能较慢）…");
-                let result = (|| -> Result<String, String> {
-                    let child = spawn_harness().map_err(|e| {
-                        let msg = format!(
-                            "未找到 dsh：{e}。请先安装 Node >= 22 并全局安装：npm install -g @deepseek-ai/dsh \
-                             （或设置 DSH_BIN 指向 dsh 的 lib/bin.js 绝对路径）"
-                        );
-                        log_line(&format!("spawn_harness failed: {msg}"));
-                        msg
-                    })?;
-                    let pid = child.id();
-                    *state_for_thread.pid.lock().unwrap() = Some(pid);
-                    *state_for_thread.child.lock().unwrap() = Some(child);
-                    log_line(&format!("child stored pid={pid}; waiting for ready URL"));
-                    emit_startup(&handle, "info", "wait", "dsh 已启动，等待服务就绪…");
-                    read_ready_url(state_for_thread.child.lock().unwrap().as_mut().unwrap())
-                })();
+            let harness_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            start_harness(&app.handle().clone(), state.clone(), harness_attempts.clone());
 
-                match result {
-                    Ok(url) => {
-                        log_line(&format!("harness ready: {url}; navigating"));
-                        emit_startup(&handle, "info", "ready", "服务已就绪，正在加载界面…");
-                        if let Some(window) = handle.get_webview_window("main") {
-                            match window.navigate(url.parse().expect("loopback url")) {
-                                Ok(()) => log_line("window.navigate() accepted"),
-                                Err(e) => log_line(&format!("ERROR: window.navigate failed: {e}")),
-                            }
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                            log_line("window navigated & shown");
-                        } else {
-                            log_line("ERROR: main window not found");
-                        }
+            // 重试启动 from the placeholder page: relaunch dsh without restarting
+            // the whole app. Only meaningful while the window is still on the
+            // placeholder — once the harness page is up, a retry would navigate
+            // away from a working UI, so it is refused.
+            {
+                let retry_app = app.handle().clone();
+                let retry_state = state.clone();
+                let retry_attempts = harness_attempts.clone();
+                app.handle().listen("dsh-retry-start", move |_e| {
+                    let on_placeholder = retry_app
+                        .get_webview_window("main")
+                        .and_then(|w| w.url().ok())
+                        .map(|url| {
+                            // The placeholder is the bundled app URL (tauri://…/index.html);
+                            // the harness page is the loopback dsh URL.
+                            url.scheme() == "tauri" || url.path().ends_with("/index.html")
+                        })
+                        .unwrap_or(false);
+                    if !on_placeholder {
+                        log_line("retry start ignored: the harness page is already loaded");
+                        return;
                     }
-                    Err(msg) => {
-                        log_line(&format!("startup failed: {msg}"));
-                        kill_tree(*state_for_thread.pid.lock().unwrap());
-                        // Keep the window open with the reason on the
-                        // placeholder page (styled as an error) instead of a
-                        // silent exit — the user can close it via the custom
-                        // titlebar X, which still runs the cleanup path.
-                        emit_startup(&handle, "error", "error", format!("{msg}\n\n详细日志：{}", log_path().display()));
-                    }
-                }
-            });
+                    log_line("retry start requested by the startup page");
+                    start_harness(&retry_app, retry_state.clone(), retry_attempts.clone());
+                });
+            }
 
             Ok(())
         })
