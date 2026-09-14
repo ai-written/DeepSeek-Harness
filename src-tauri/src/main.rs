@@ -1274,8 +1274,9 @@ fn maybe_announce_update(
     let notes = notes.unwrap_or_else(fetch_release_notes);
     // Which build this user should get: the release's own asset list, ranked so
     // the first entry matches the running build (portable exe → portable asset,
-    // installed copy → NSIS setup). Best-effort — an empty list means the banner
-    // falls back to opening the release page.
+    // NSIS install → setup.exe, MSI install → MSI). Best-effort — an empty list
+    // means the banner falls back to opening the release page.
+    let packaging = running_packaging_kind();
     let assets = fetch_release_assets(endpoint, tag);
     let asset_label = assets
         .first()
@@ -1289,7 +1290,10 @@ fn maybe_announce_update(
         "notes": notes,
         "assets": assets,
         "assetLabel": asset_label,
-        "portable": running_portable(),
+        "portable": packaging == PackagingKind::Portable,
+        // The exact packaging, so the banner can label the pick correctly and the
+        // download request can carry its own kind back to the launcher.
+        "packaging": packaging.asset_kind(),
     });
     log_line(&format!("update available: {tag} (current {current})"));
     *cache.lock().unwrap() = Some(payload.clone());
@@ -1360,32 +1364,287 @@ fn sanitize_filename(name: &str) -> String {
     cleaned.trim().trim_matches('.').to_string()
 }
 
-/// Windows: does the uninstall registry hold a DeepSeek-Harness install? NSIS
-/// and MSI both register one, so this catches an installed copy whose exe the
-/// user happens to be running from somewhere else.
+/// Which Windows packaging produced the running executable. The updater must
+/// keep this distinction: an MSI-installed copy must update with the MSI, an
+/// NSIS-installed copy with `...-setup.exe`, and a standalone copy with
+/// `...-portable.exe`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PackagingKind {
+    Portable,
+    Nsis,
+    Msi,
+}
+
+impl PackagingKind {
+    /// The release asset kind that matches this packaging (`classify_asset`).
+    fn asset_kind(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::Nsis => "installer",
+            Self::Msi => "msi",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Portable => "免安装版",
+            Self::Nsis => "安装版（NSIS 安装包）",
+            Self::Msi => "安装版（MSI 安装包）",
+        }
+    }
+}
+
+/// One row of the Windows uninstall registry (the metadata behind 应用和功能),
+/// kept as plain strings and a flag so the matcher below stays pure and can be
+/// exercised by tests on any host.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct UninstallRecord {
+    display_name: String,
+    install_location: String,
+    display_icon: String,
+    uninstall_string: String,
+    quiet_uninstall_string: String,
+    /// Windows Installer (MSI) products set this; NSIS never does.
+    windows_installer: bool,
+}
+
+/// A registry command value is a COMMAND LINE, not a path:
+/// `"C:\dir\uninstall.exe" /S` → `C:\dir\uninstall.exe`. An unquoted value with
+/// arguments (`MsiExec.exe /X{…}`) keeps its arguments, which simply never
+/// matches a file path — that is the safe outcome.
+fn command_path(raw: &str) -> &str {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return rest[..end].trim_end();
+        }
+    }
+    s
+}
+
+/// Normalize a Windows path for comparison: strip the `,<icon-index>` suffix of
+/// `DisplayIcon`, surrounding quotes, a `\\?\` prefix, unify separators and drop
+/// a trailing separator, then lowercase (Windows paths compare
+/// case-insensitively). Purely textual on purpose — it must work unchanged when
+/// the tests run on a non-Windows host.
+fn normalize_windows_path(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    // DisplayIcon is `<path>,<icon-index>`.
+    if let Some((head, tail)) = s.rsplit_once(',') {
+        let tail = tail.trim();
+        if !head.trim().is_empty() && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            s = head.trim().to_string();
+        }
+    }
+    let mut s = s.trim().trim_matches('"').trim().to_string();
+    // Extended-length prefix: `\\?\C:\dir` / `\\?\UNC\server\share`.
+    if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        s = match rest.strip_prefix("UNC\\") {
+            Some(unc) => format!("\\\\{unc}"),
+            None => rest.to_string(),
+        };
+    }
+    let mut s = s.replace('/', "\\");
+    // Never trim a bare drive root down to `c:`.
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    s.to_lowercase()
+}
+
+/// The directory part of an already normalized path (`""` when there is none).
+/// A bare drive root (`c:`) is deliberately reported as "no directory": it is too
+/// weak to prove that a record describes the running executable.
+fn normalized_parent(path: &str) -> &str {
+    let idx = match path.rfind('\\') {
+        Some(idx) if idx > 0 => idx,
+        _ => return "",
+    };
+    let parent = &path[..idx];
+    if parent.contains('\\') {
+        parent
+    } else {
+        ""
+    }
+}
+
+/// Does this uninstall record point at the running executable — or at the folder
+/// holding it? Only such a record is evidence about THIS process, which is what
+/// keeps a portable copy portable on a machine that also has the app installed.
+/// Every field is tried, because the four record shapes differ between NSIS
+/// (`InstallLocation` = install dir, `UninstallString` = `<dir>\uninstall.exe`)
+/// and MSI (`InstallLocation` from ARPINSTALLLOCATION, `DisplayIcon` sometimes the
+/// app itself).
+fn record_matches_exe(record: &UninstallRecord, exe: &str) -> bool {
+    let exe_path = normalize_windows_path(exe);
+    if exe_path.is_empty() {
+        return false;
+    }
+    let exe_dir = normalized_parent(&exe_path);
+    for field in [
+        record.install_location.as_str(),
+        record.display_icon.as_str(),
+        record.uninstall_string.as_str(),
+        record.quiet_uninstall_string.as_str(),
+    ] {
+        let candidate = normalize_windows_path(command_path(field));
+        if candidate.is_empty() {
+            continue;
+        }
+        if candidate == exe_path {
+            return true;
+        }
+        // The value names the install DIRECTORY (InstallLocation, or the folder
+        // holding the uninstaller), or an ancestor of it.
+        if !exe_dir.is_empty() && (candidate == exe_dir || normalized_parent(&candidate) == exe_dir) {
+            return true;
+        }
+        if exe_path.starts_with(&format!("{candidate}\\")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Windows Installer marks its own products; NSIS never does. The uninstall
+/// command is checked as a second signal because the flag is occasionally absent
+/// from mirrored or partially exported registry data.
+fn is_msi_record(record: &UninstallRecord) -> bool {
+    record.windows_installer
+        || record.uninstall_string.to_ascii_lowercase().contains("msiexec")
+        || record.quiet_uninstall_string.to_ascii_lowercase().contains("msiexec")
+}
+
+/// Decide the packaging from pure evidence: the running executable's path, an
+/// uninstaller sitting next to it, and the uninstall registry records. Records
+/// that do not name this executable are ignored entirely, so an unrelated
+/// installation can never redirect the download of a standalone build.
+fn classify_packaging(
+    exe: &str,
+    adjacent_uninstaller: bool,
+    records: &[UninstallRecord],
+) -> PackagingKind {
+    let matching: Vec<&UninstallRecord> = records
+        .iter()
+        .filter(|r| r.display_name.to_ascii_lowercase().starts_with("deepseek-harness"))
+        .filter(|r| record_matches_exe(r, exe))
+        .collect();
+    // MSI first: only a Windows Installer product sets WindowsInstaller=1, and an
+    // MSI install may well leave a `uninstall.exe` next to the app, so this signal
+    // must outrank the adjacent-uninstaller heuristic. Otherwise an MSI install
+    // would be classified as NSIS and keep downloading the setup exe.
+    if matching.iter().any(|r| is_msi_record(r)) {
+        return PackagingKind::Msi;
+    }
+    // A matched non-MSI record, or an uninstaller next to the exe (the portable
+    // build never ships one), means an installer-managed copy.
+    if adjacent_uninstaller || !matching.is_empty() {
+        return PackagingKind::Nsis;
+    }
+    PackagingKind::Portable
+}
+
+/// Parse the JSON the registry query prints. `[]`, an empty string and anything
+/// unparsable all degrade to "no evidence" rather than a wrong answer.
+fn parse_uninstall_records(json: &str) -> Vec<UninstallRecord> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(rows) = serde_json::from_str::<Vec<UninstallRecord>>(trimmed) {
+        return rows;
+    }
+    // ConvertTo-Json emits a bare object instead of a one-element array on some
+    // PowerShell versions; accept that shape too.
+    match serde_json::from_str::<UninstallRecord>(trimmed) {
+        Ok(row) => vec![row],
+        Err(e) => {
+            log_line(&format!("update download: uninstall registry parse failed: {e}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Reads the uninstall entries for a DeepSeek-Harness product from the user hive
+/// and both registry views. The script is a CONSTANT — nothing (least of all a
+/// path) is ever spliced into it, and it prints one JSON array.
 #[cfg(target_os = "windows")]
-fn installed_in_registry() -> bool {
-    let script = "$keys = @('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', \
-                  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', \
-                  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); \
-                  $hit = Get-ItemProperty $keys -ErrorAction SilentlyContinue | \
-                  Where-Object { $_.DisplayName -like 'DeepSeek-Harness*' } | Select-Object -First 1; \
-                  if ($hit) { 'yes' } else { 'no' }";
+const UNINSTALL_QUERY: &str = "$ErrorActionPreference = 'SilentlyContinue'; \
+$roots = @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall', \
+  'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall', \
+  'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall'); \
+$rows = @(foreach ($root in $roots) { \
+  foreach ($key in (Get-ChildItem -LiteralPath $root)) { \
+    $p = Get-ItemProperty -LiteralPath $key.PSPath; \
+    if (-not $p) { continue } \
+    $name = [string]$p.DisplayName; \
+    if (-not $name.StartsWith('DeepSeek-Harness', [StringComparison]::OrdinalIgnoreCase)) { continue } \
+    $msi = $false; \
+    if ($null -ne $p.WindowsInstaller) { $msi = ([int]$p.WindowsInstaller -eq 1) } \
+    [pscustomobject]@{ \
+      displayName = $name; \
+      installLocation = [Environment]::ExpandEnvironmentVariables([string]$p.InstallLocation); \
+      displayIcon = [string]$p.DisplayIcon; \
+      uninstallString = [string]$p.UninstallString; \
+      quietUninstallString = [string]$p.QuietUninstallString; \
+      windowsInstaller = $msi \
+    } \
+  } \
+}); \
+[Console]::Out.Write((ConvertTo-Json -InputObject $rows -Compress -Depth 3))";
+
+#[cfg(target_os = "windows")]
+fn registry_uninstall_records() -> Vec<UninstallRecord> {
     let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-Command", script]);
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", UNINSTALL_QUERY]);
     cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     match cmd.output() {
         Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("yes")
+            parse_uninstall_records(&String::from_utf8_lossy(&out.stdout))
         }
-        _ => false,
+        Ok(out) => {
+            log_line(&format!(
+                "update download: uninstall registry query exited {}; assuming no install record",
+                out.status.code().unwrap_or(-1)
+            ));
+            Vec::new()
+        }
+        Err(e) => {
+            log_line(&format!("update download: uninstall registry query failed: {e}"));
+            Vec::new()
+        }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn installed_in_registry() -> bool {
-    false
+fn registry_uninstall_records() -> Vec<UninstallRecord> {
+    Vec::new()
+}
+
+/// Detect the packaging of THIS process, once per launch. The executable's own
+/// path decides, so neither a second installation nor a stale record can change
+/// the answer.
+fn running_packaging_kind() -> PackagingKind {
+    static CACHED: OnceLock<PackagingKind> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let Ok(exe) = std::env::current_exe() else {
+            log_line("update download: current_exe failed; treating this build as 免安装版");
+            return PackagingKind::Portable;
+        };
+        let adjacent_uninstaller = exe.parent().is_some_and(|dir| {
+            dir.join("uninstall.exe").exists() || dir.join("Uninstall.exe").exists()
+        });
+        let records = registry_uninstall_records();
+        let kind = classify_packaging(&exe.to_string_lossy(), adjacent_uninstaller, &records);
+        log_line(&format!(
+            "update download: packaging -> {} (uninstaller next to exe: {adjacent_uninstaller}, {} uninstall record(s) scanned)",
+            kind.label(),
+            records.len()
+        ));
+        kind
+    })
 }
 
 // ── dsh version manager ──────────────────────────────────────────────────────
@@ -2106,40 +2365,6 @@ fn build_versions_payload(include_registry: bool) -> serde_json::Value {
     })
 }
 
-/// True when this build is the standalone (免安装) exe rather than an installed
-/// copy. Drives which release asset to download: portable users get
-/// `..._x64-portable.exe`, installed users get the NSIS `..._x64-setup.exe`
-/// (MSI for an MSI install), so nobody has to think about which file is theirs.
-///
-/// Two signals, cheapest first:
-///   1. an uninstaller next to the running exe — NSIS/MSI always installs one,
-///      the portable build never ships one;
-///   2. otherwise the uninstall registry, which catches the case where a
-///      portable exe is being run on a machine that also has the app installed.
-/// Detection is a preference only: a mis-detected portable user simply gets the
-/// installer, which is the build GitHub also leads with.
-fn running_portable() -> bool {
-    // The registry probe below starts a PowerShell process; do that at most
-    // once per launch, however often the banner asks.
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    if let Some(v) = CACHED.get() {
-        return *v;
-    }
-    let exe_dir_has_uninstaller = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
-        .is_some_and(|dir| {
-            dir.join("uninstall.exe").exists() || dir.join("Uninstall.exe").exists()
-        });
-    let portable = !exe_dir_has_uninstaller && !installed_in_registry();
-    log_line(&format!(
-        "update download: build kind -> {} (uninstaller next to exe: {exe_dir_has_uninstaller})",
-        if portable { "免安装版 portable" } else { "安装版 installed" }
-    ));
-    let _ = CACHED.set(portable);
-    portable
-}
-
 /// One downloadable asset from the release. `url` is answered directly by
 /// GitHub's asset host, so the banner can download without opening the browser.
 #[derive(serde::Serialize, Clone, Debug)]
@@ -2177,14 +2402,23 @@ fn classify_asset(name: &str) -> Option<&'static str> {
 }
 
 /// Ordering key for one asset, relative to this build. Lower sorts first.
-fn asset_rank(kind: &str, portable: bool, name: &str) -> u32 {
+///
+/// The build's OWN packaging always wins: an MSI-installed copy must update with
+/// the MSI, an NSIS-installed copy with `...-setup.exe`, and a portable copy with
+/// `...-portable.exe`. The remaining kinds follow in a stable order so a release
+/// missing the ideal asset still offers something usable.
+fn asset_rank(kind: &str, packaging: PackagingKind, name: &str) -> u32 {
     let x64 = if name.to_ascii_lowercase().contains("x64") { 0 } else { 1 };
-    let base = match (kind, portable) {
-        ("portable", true) => 0,
-        ("installer", false) => 0,
-        ("installer", true) => 1,
-        ("portable", false) => 1,
-        ("msi", _) => 2,
+    let base = match (kind, packaging) {
+        ("portable", PackagingKind::Portable) => 0,
+        ("installer", PackagingKind::Nsis) => 0,
+        ("msi", PackagingKind::Msi) => 0,
+        ("installer", PackagingKind::Portable) => 1,
+        ("portable", PackagingKind::Nsis) => 1,
+        ("installer", PackagingKind::Msi) => 1,
+        ("msi", PackagingKind::Portable) => 2,
+        ("msi", PackagingKind::Nsis) => 2,
+        ("portable", PackagingKind::Msi) => 2,
         _ => 3,
     };
     base * 10 + x64
@@ -2192,7 +2426,12 @@ fn asset_rank(kind: &str, portable: bool, name: &str) -> u32 {
 
 /// Every usable asset of the release, best candidate for this build first.
 fn collect_assets(value: &serde_json::Value) -> Vec<AssetEntry> {
-    let portable = running_portable();
+    collect_assets_for(value, running_packaging_kind())
+}
+
+/// The packaging-agnostic half of [`collect_assets`], so asset selection can be
+/// tested without touching the host's registry or the running executable.
+fn collect_assets_for(value: &serde_json::Value, packaging: PackagingKind) -> Vec<AssetEntry> {
     let mut out: Vec<AssetEntry> = Vec::new();
     if let Some(arr) = value.get("assets").and_then(|x| x.as_array()) {
         for a in arr {
@@ -2217,11 +2456,11 @@ fn collect_assets(value: &serde_json::Value) -> Vec<AssetEntry> {
             });
         }
     }
-    out.sort_by_key(|a| asset_rank(&a.kind, portable, &a.name));
+    out.sort_by_key(|a| asset_rank(&a.kind, packaging, &a.name));
     log_line(&format!(
         "update check: {} downloadable asset(s) (running {})",
         out.len(),
-        if portable { "portable exe" } else { "installed copy" }
+        packaging.label()
     ));
     for a in &out {
         log_line(&format!("  asset [{}] {} ({} bytes)", a.kind, a.name, a.size));
@@ -2321,6 +2560,11 @@ fn fetch_release_assets(endpoint: &str, tag: &str) -> Vec<AssetEntry> {
 /// API path, so the build-kind preference still applies. `digest` is unknown
 /// here; the caller reports that the sha256 check was skipped.
 fn derived_assets(endpoint: &str, tag: &str) -> Vec<AssetEntry> {
+    derived_assets_for(endpoint, tag, running_packaging_kind())
+}
+
+/// The packaging-agnostic half of [`derived_assets`] (see [`collect_assets_for`]).
+fn derived_assets_for(endpoint: &str, tag: &str, packaging: PackagingKind) -> Vec<AssetEntry> {
     let version = tag.trim_start_matches('v').trim_start_matches('V');
     // Guard against a tag that is not a version at all (a `--latest` style
     // alias): deriving a name from it would only produce a 404.
@@ -2346,7 +2590,6 @@ fn derived_assets(endpoint: &str, tag: &str) -> Vec<AssetEntry> {
         ("installer", format!("DeepSeek-Harness_{version}_x64-setup.exe")),
         ("msi", format!("DeepSeek-Harness_{version}_x64_en-US.msi")),
     ];
-    let portable = running_portable();
     let mut out: Vec<AssetEntry> = names
         .into_iter()
         .map(|(kind, name)| AssetEntry {
@@ -2357,7 +2600,7 @@ fn derived_assets(endpoint: &str, tag: &str) -> Vec<AssetEntry> {
             digest: String::new(),
         })
         .collect();
-    out.sort_by_key(|a| asset_rank(&a.kind, portable, &a.name));
+    out.sort_by_key(|a| asset_rank(&a.kind, packaging, &a.name));
     out
 }
 
@@ -2478,12 +2721,20 @@ fn known_downloads_dir() -> Option<std::path::PathBuf> {
         if trimmed.is_empty() {
             return None;
         }
-        let path = std::path::PathBuf::from(trimmed);
+        let path = std::path::PathBuf::from(&trimmed);
         if path.is_dir() {
-            Some(path)
-        } else {
-            None
+            return Some(path);
         }
+        // The configured folder may simply not exist yet on a fresh profile. It is
+        // still the RIGHT answer, so it is accepted (and created by the caller)
+        // when it is a rooted path whose parent already exists — accepting only
+        // existing directories is what silently redirected downloads to
+        // `%USERPROFILE%\Downloads` while the user's 下载 pointed elsewhere.
+        let rooted = trimmed.starts_with("\\\\") || trimmed.chars().nth(1) == Some(':');
+        if rooted && path.parent().is_some_and(|p| p.is_dir()) {
+            return Some(path);
+        }
+        None
     };
 
     // 1. Known-folder API through the shell namespace.
@@ -2527,11 +2778,42 @@ fn known_downloads_dir() -> Option<std::path::PathBuf> {
 /// then falls back to `%USERPROFILE%\Downloads`; other platforms use
 /// `$HOME/Downloads`. The chosen directory is always logged, so a user who cannot
 /// find the file can read the exact path (the tab also shows it) out of the log.
+///
+/// Resolved once per launch: finding it starts PowerShell processes (shell
+/// namespace + registry), and the banner's `install`/`reveal` requests are handled
+/// on the event-loop thread, which must not block for half a second. The directory
+/// only changes when the user re-points 下载 in Windows, which takes a restart
+/// anyway; `create_dir_all` still runs per call so a folder deleted mid-session is
+/// recreated instead of turning the next download into a write error.
 fn download_dir() -> std::path::PathBuf {
+    static CACHED: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let dir = CACHED.get_or_init(resolve_download_dir).clone();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_line(&format!(
+            "update download: could not create {} ({e}); the transfer will report the failure",
+            dir.display()
+        ));
+    }
+    dir
+}
+
+/// The one-time half of [`download_dir`]: actually probe the shell.
+fn resolve_download_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Some(dir) = known_downloads_dir() {
-            return dir;
+            // The known folder may not exist yet (fresh profile): create it rather
+            // than downloading somewhere the user's 下载 does not point at.
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    log_line(&format!("update download: using the shell's 下载 folder {}", dir.display()));
+                    return dir;
+                }
+                Err(e) => log_line(&format!(
+                    "update download: could not create the shell's 下载 folder {} ({e}); falling back",
+                    dir.display()
+                )),
+            }
         }
         if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
             let dir = std::path::PathBuf::from(profile).join("Downloads");
@@ -2986,21 +3268,32 @@ fn unblock_file(path: &std::path::Path) {
 #[cfg(not(target_os = "windows"))]
 fn unblock_file(_path: &std::path::Path) {}
 
-/// Show the downloaded file in the file manager, selected.
+/// Show `path` in the file manager: a folder is opened, a file is revealed
+/// selected inside its folder.
 ///
-/// Also used for the log: for a text file the Explorer association may ignore
-/// `/select`, so when the file has an extension whose default handler opens it
-/// (a `.log`), launching the shell's `start` is a better second try than showing
-/// the folder again.
+/// The `/select,"<path>"` switch must NOT go through Rust's ordinary argument
+/// escaping: an embedded `"` is rewritten as `\"`, which Explorer does not
+/// understand, so it falls back to opening its own default location (文档) instead
+/// of the folder holding the download — the reason a downloaded portable exe
+/// appeared to land "somewhere else". `raw_arg` passes the switch verbatim.
+/// Text artifacts (startup.log) are additionally opened with their default
+/// handler, which is what 打开日志 asks for.
 fn reveal_in_file_manager(path: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
-        // The `/select,` switch must not be quoted on its own; the whole
-        // argument is quoted as one unit so a path with spaces survives.
-        let arg = format!("/select,\"{}\"", path.display());
-        if let Err(e) = Command::new("explorer").arg(&arg).spawn() {
-            log_line(&format!("update download: explorer /select failed ({e}); opening the folder"));
-            if let Some(dir) = path.parent() {
+        // A directory is opened directly; `/select` on a directory would select it
+        // inside its PARENT, which is not what the caller means.
+        let mut cmd = Command::new("explorer");
+        if path.is_dir() {
+            cmd.raw_arg(format!("\"{}\"", path.display()));
+        } else {
+            cmd.raw_arg(format!("/select,\"{}\"", path.display()));
+        }
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        if let Err(e) = cmd.spawn() {
+            log_line(&format!("update download: explorer failed ({e}); opening the folder instead"));
+            let fallback = if path.is_dir() { Some(path.to_path_buf()) } else { path.parent().map(|p| p.to_path_buf()) };
+            if let Some(dir) = fallback {
                 let _ = Command::new("explorer").arg(dir).spawn();
             }
         }
@@ -3027,16 +3320,232 @@ fn reveal_in_file_manager(path: &std::path::Path) {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let dir = path.parent().unwrap_or(path);
+        let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
         let _ = Command::new("xdg-open").arg(dir).spawn();
     }
 }
 
-/// Download one release asset into the Downloads folder, verify it and reveal
-/// it. Runs on its own thread; every outcome is reported to the banner as a
-/// `dsh-update-progress` event (`state` = started | done | failed) and logged.
-/// When the direct download cannot proceed at all, `release_page` is opened in
-/// the browser instead, so the button is never a dead end.
+/// True when an installer's exit code means "the update really was installed".
+/// 3010 (reboot required) and 1641 (reboot initiated) are MSI successes, so the
+/// downloaded file may be removed; 1223 = the user cancelled the UAC prompt and
+/// 1602 = the user cancelled the MSI, in which case the file must be KEPT so the
+/// update can be retried without downloading it again.
+///
+/// Tauri's NSIS installer aborts with exit code **2** both when the user cancels
+/// the wizard and when they decline the "close the running app" prompt (measured
+/// against generated `installer.nsi`/`utils.nsh`: `Abort`/`Quit` → 2, a completed
+/// install → 0), so a cancellation is never mistaken for a success.
+fn installer_succeeded(code: i32) -> bool {
+    matches!(code, 0 | 3010 | 1641)
+}
+
+/// May `path` be executed as the update installer?
+///
+/// Only a file THIS app just downloaded may be: the name has to look like an
+/// installer (`...-setup.exe` / `.msi`) and the file has to sit in the download
+/// folder. Without this, the banner's `mode:"install"` event would be a "run any
+/// local executable you name" channel for whatever the page asks for.
+fn may_install_from(download_dir: &std::path::Path, path: &std::path::Path, kind: &str) -> bool {
+    if kind != "installer" && kind != "msi" {
+        return false;
+    }
+    if !path.is_file() {
+        return false;
+    }
+    path.parent().is_some_and(|dir| same_dir(dir, download_dir))
+}
+
+/// Do two directories name the same place? `canonicalize` resolves `.`, `..`,
+/// short 8.3 names and symlinks; Windows compares case-insensitively.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (a, b) = (canon(a), canon(b));
+    #[cfg(target_os = "windows")]
+    {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        a == b
+    }
+}
+
+/// Is `url` one of the release assets the update check announced?
+///
+/// The banner only ever asks for those, so requiring it keeps the download — and
+/// therefore the automatic installation that follows it — limited to files that
+/// came out of this app's own update check, rather than letting the page fetch
+/// and then run an arbitrary payload.
+fn is_announced_asset(cache: &Option<serde_json::Value>, url: &str) -> bool {
+    cache
+        .as_ref()
+        .and_then(|p| p.get("assets"))
+        .and_then(|a| a.as_array())
+        .is_some_and(|assets| {
+            assets
+                .iter()
+                .any(|a| a.get("url").and_then(|u| u.as_str()) == Some(url))
+        })
+}
+
+/// Escape a Windows path for embedding in a PowerShell single-quoted string.
+#[cfg(target_os = "windows")]
+fn ps_single_quoted(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "''"))
+}
+
+/// Start a downloaded installer and delete its file once the installation has
+/// finished — the whole "下载即安装" step the banner used to leave to the user.
+///
+/// The work happens in a DETACHED PowerShell helper rather than in this process:
+/// an installer routinely closes the application it is replacing (Tauri's NSIS
+/// setup asks to close it, then kills it), and a helper that were a child of ours
+/// would die with it and never clean up. `Start-Process` is used for its
+/// ShellExecute semantics: a `requireAdministrator` installer then raises the UAC
+/// prompt itself instead of failing CreateProcess with ERROR_ELEVATION_REQUIRED
+/// (740), and an MSI goes through `msiexec /i` because it is not executable.
+///
+/// Returns the helper child; its exit code is the installer's own code.
+#[cfg(target_os = "windows")]
+fn spawn_install_helper(target: &std::path::Path, kind: &str) -> Result<Child, String> {
+    let target_arg = ps_single_quoted(&target.display().to_string());
+    let launch = if kind == "msi" {
+        // `-ArgumentList` joins its array elements with a SPACE and adds no quotes
+        // of its own, so a download path containing spaces would be split into
+        // several arguments (verified: `/i C:\Users\me\My Downloads\x.msi` arrived
+        // as four of them). The quotes therefore have to be part of the argument.
+        format!(
+            "$p = Start-Process -FilePath \"$env:SystemRoot\\System32\\msiexec.exe\" -ArgumentList @('/i', ('\"' + {target_arg} + '\"')) -PassThru -Wait"
+        )
+    } else {
+        format!("$p = Start-Process -FilePath {target_arg} -PassThru -Wait")
+    };
+    // `exit 1223` is ERROR_CANCELLED: either the user dismissed the UAC prompt or
+    // ShellExecute refused, and the caller keeps the file for a retry.
+    //
+    // `$code = -1` means "the installer's result could not be read". Deleting on
+    // that would throw the download away on a guess, so the sentinel is outside
+    // the success set: the file stays and the banner reports it as unfinished.
+    //
+    // The success set below MUST stay in step with `installer_succeeded` on the
+    // Rust side (this script deletes the file; Rust decides what to report).
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         try {{ {launch} }} catch {{ exit 1223 }}; \
+         $code = -1; \
+         if ($p -and $null -ne $p.ExitCode) {{ $code = [int]$p.ExitCode }}; \
+         if ($code -eq 0 -or $code -eq 3010 -or $code -eq 1641) {{ \
+           Start-Sleep -Milliseconds 800; \
+           Remove-Item -LiteralPath {target_arg} -Force -ErrorAction SilentlyContinue \
+         }}; \
+         exit $code"
+    );
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.spawn().map_err(|e| format!("无法启动安装程序：{e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_install_helper(target: &std::path::Path, _kind: &str) -> Result<Child, String> {
+    Err(format!(
+        "自动安装仅支持 Windows：请手动运行 {}",
+        target.display()
+    ))
+}
+
+/// Run a verified installer and report the outcome to the banner: `installed`
+/// once the install really happened (the download is then deleted — by the helper,
+/// and again here as a belt-and-braces pass), or `launched` when it was cancelled
+/// or failed, in which case the file is KEPT so it can be retried without
+/// downloading it again.
+///
+/// The waiting happens on its own thread: the installer routinely closes this
+/// application to replace its files, and the helper — being a separate process —
+/// still finishes the cleanup in that case.
+fn install_and_report(
+    app: tauri::AppHandle,
+    target: std::path::PathBuf,
+    kind: String,
+    req: String,
+) {
+    let emit = move |state: &str, message: String, file: Option<String>| {
+        let _ = app.emit(
+            "dsh-update-progress",
+            serde_json::json!({
+                "state": state,
+                "message": message,
+                "file": file,
+                "req": req.as_str(),
+            }),
+        );
+    };
+    let target_display = target.display().to_string();
+    match spawn_install_helper(&target, &kind) {
+        Ok(mut helper) => {
+            std::thread::spawn(move || {
+                let code = match helper.wait() {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(e) => {
+                        log_line(&format!("update install: waiting for the installer failed: {e}"));
+                        -1
+                    }
+                };
+                log_line(&format!("update install: installer exit code {code}"));
+                if installer_succeeded(code) {
+                    if std::path::Path::new(&target_display).exists() {
+                        if let Err(e) = std::fs::remove_file(&target_display) {
+                            log_line(&format!("update install: could not delete {target_display}: {e}"));
+                        }
+                    }
+                    let cleaned = !std::path::Path::new(&target_display).exists();
+                    emit(
+                        "installed",
+                        if cleaned {
+                            format!(
+                                "{}安装完成，安装包已自动删除",
+                                if kind == "msi" { "MSI " } else { "" }
+                            )
+                        } else {
+                            "安装完成（安装包清理失败，可手动删除）".to_string()
+                        },
+                        None,
+                    );
+                } else {
+                    emit(
+                        "launched",
+                        match code {
+                            1223 => "已取消安装（安装包已保留，可重新安装）".to_string(),
+                            1602 => "安装已取消（安装包已保留，可重新安装）".to_string(),
+                            _ => format!("安装未完成（退出码 {code}，安装包已保留，可手动运行）"),
+                        },
+                        Some(target_display),
+                    );
+                }
+            });
+        }
+        Err(e) => {
+            log_line(&format!("update install: launch failed: {e}"));
+            reveal_in_file_manager(&target);
+            emit(
+                "done",
+                format!("自动安装失败：{e}（已为你选中安装包，可手动运行）"),
+                Some(target_display),
+            );
+        }
+    }
+}
+
+/// Download one release asset into the Downloads folder, verify it, then either
+/// install it (installer/MSI) or reveal it (portable). Runs on its own thread;
+/// every outcome is reported to the banner as a `dsh-update-progress` event
+/// (`state` = started | progress | installing | installed | launched | done |
+/// failed, see [`install_and_report`]) and logged. When the direct download cannot
+/// proceed at all, `release_page` is opened in the browser instead, so the button
+/// is never a dead end.
 fn download_update_asset(
     app: &tauri::AppHandle,
     url: String,
@@ -3044,7 +3553,10 @@ fn download_update_asset(
     expected_len: u64,
     digest: Option<String>,
     release_page: String,
+    req: String,
 ) {
+    // Every event carries the page's request id so a late event from an earlier
+    // download can never overwrite a banner that has since been replaced.
     let report = |state: &str, message: &str, path: Option<String>| {
         let _ = app.emit(
             "dsh-update-progress",
@@ -3052,13 +3564,20 @@ fn download_update_asset(
                 "state": state,
                 "message": message,
                 "file": path,
+                "req": req.as_str(),
             }),
         );
     };
+    // The asset kind is decided from the FILE NAME the page asked us to save, not
+    // from the page's claim about it: the name is what decides how the file will
+    // later be executed, so a tampered or stale payload can at most downgrade this
+    // to "download it, but do not run it". A name that is neither an installer nor
+    // an MSI is therefore never run, even if the page insists it is one.
+    let kind = classify_asset(&file_name).unwrap_or("other").to_string();
     let dir = download_dir();
     let target = resolve_free_path(&dir, &file_name);
     log_line(&format!(
-        "update download: start {} -> {} ({expected_len} bytes, digest {})",
+        "update download: start {} -> {} ({expected_len} bytes, digest {}, kind {kind})",
         url,
         target.display(),
         digest.as_deref().unwrap_or("none")
@@ -3069,6 +3588,7 @@ fn download_update_asset(
     // delta (plus the final byte) so a fast link cannot flood the page with events.
     let total = expected_len;
     let last_reported = std::sync::atomic::AtomicU64::new(0);
+    let req_for_progress = req.clone();
     let progress = move |received: u64, reported_total: u64| {
         let prev = last_reported.load(std::sync::atomic::Ordering::Relaxed);
         let is_final = reported_total > 0 && received >= reported_total;
@@ -3093,6 +3613,7 @@ fn download_update_asset(
                 "received": received,
                 "total": total,
                 "file": null,
+                "req": req_for_progress.as_str(),
             }),
         );
     };
@@ -3113,8 +3634,24 @@ fn download_update_asset(
                 None => log_line("update download: release published no digest; skipping sha256"),
             }
             unblock_file(&target);
-            reveal_in_file_manager(&target);
             let size_mb = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0);
+
+            // Only a real installer is run automatically. The portable exe IS the
+            // update (the user keeps running it), so launching it would just start
+            // a second instance — it is revealed instead.
+            if kind == "installer" || kind == "msi" {
+                let label = if kind == "msi" { "MSI 安装包" } else { "安装程序" };
+                report(
+                    "installing",
+                    &format!("已下载（{size_mb:.1} MB），正在启动{label}…"),
+                    Some(target.display().to_string()),
+                );
+                log_line(&format!("update install: launching {label} {}", target.display()));
+                install_and_report(app.clone(), target.clone(), kind.clone(), req.clone());
+                return;
+            }
+
+            reveal_in_file_manager(&target);
             // The full path is part of the message on purpose: a redirected or
             // missing 下载 folder makes "已在文件夹中选中" impossible to verify by
             // eye, and telling the user exactly where the file is ends the guesswork.
@@ -3126,18 +3663,23 @@ fn download_update_asset(
         }
         Err(e) => {
             log_line(&format!("update download: failed: {e}"));
-            report("failed", &e, None);
             // Never leave the button a dead end — send the user to the release
             // page where they can pick a file by hand (the original behavior).
             // Asset URLs derived without the API are a naming-convention guess,
             // so a 404 in particular means "the real file is named differently".
+            // The message carries the hint, because only this side knows whether
+            // the browser was actually opened.
             let guess_missed = e.contains("HTTP 404");
-            if release_page.starts_with("http") {
+            let hint = if release_page.starts_with("http") {
                 log_line(&format!(
                     "update download: falling back to the release page: {release_page} (derived-asset miss: {guess_missed})"
                 ));
                 open_url_in_browser(&release_page);
-            }
+                "已为你打开 GitHub 发布页，也可点此重试"
+            } else {
+                "可点此重试"
+            };
+            report("failed", &format!("{e}（{hint}）"), None);
         }
     }
 }
@@ -3812,7 +4354,10 @@ fn main() {
                 // swallows window.open) and cannot download files from the
                 // remote harness origin, so both route through this event:
                 //   {mode:"download"} → fetch the release asset matching this
-                //     build straight into the Downloads folder (no browser);
+                //     build straight into the Downloads folder, then install it
+                //     (installer/MSI) or reveal it (portable), with no browser;
+                //   {mode:"install"/"reveal"} with a path → re-run or show a
+                //     file that was already downloaded;
                 //   {mode:"download"} without a usable URL, {mode:"browser"},
                 //     or any bad payload → open the release page in the system
                 //     default browser, exactly as the banner always did.
@@ -3821,6 +4366,9 @@ fn main() {
                 // closure later spawns the download thread, which requires a
                 // Send context, and the setup closure's `&App` is not Send.
                 let update_open_app = app.handle().clone();
+                // The announced asset list is consulted before downloading anything:
+                // only URLs this app offered may be fetched (see is_announced_asset).
+                let announced_assets = update_cache.clone();
                 app.handle().listen("dsh-update-open", move |event| {
                     let app_handle = update_open_app.clone();
                     let payload_str = event.payload().to_string();
@@ -3846,38 +4394,132 @@ fn main() {
                         .and_then(|x| x.as_str())
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string());
+                    // The page's own idea of the asset kind. It is only a fallback:
+                    // download_update_asset decides from the file name, which is
+                    // what will actually be executed.
+                    let kind = obj
+                        .and_then(|o| o.get("kind"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string();
                     // Where to send the user when a direct download cannot run.
                     let release_page = obj
                         .and_then(|o| o.get("releaseUrl"))
                         .and_then(|x| x.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| DEFAULT_UPDATE_URL.to_string());
+                    // The banner tags every request so it can ignore events that
+                    // belong to a download it has already replaced.
+                    let req = obj
+                        .and_then(|o| o.get("req"))
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    // Only an asset the update check announced may be fetched (and
+                    // therefore auto-installed). Computed up front so the cache lock
+                    // is released before any work happens.
+                    let download_allowed = {
+                        let announced = announced_assets.lock().unwrap();
+                        url.as_deref().is_some_and(|u| {
+                            u.starts_with("http") && is_announced_asset(&announced, u)
+                        })
+                    };
                     match (mode.as_str(), url) {
-                        ("download", Some(url)) if url.starts_with("http") => {
+                        ("download", Some(url)) if download_allowed => {
                             let file_name = if name.is_empty() {
                                 filename_from_url(&url).unwrap_or_else(|| "deepseek-harness-update.exe".into())
                             } else {
                                 name
                             };
                             log_line(&format!(
-                                "update download: requested by banner -> {file_name} ({url})"
+                                "update download: requested by banner -> {file_name} ({url}, page-claimed kind {kind})"
                             ));
                             // The download (and the sha256 step after it) blocks
                             // for up to DOWNLOAD_TIMEOUT_SECS, so it must not run
                             // on the event-loop thread.
                             let app_for_thread = app_handle.clone();
                             std::thread::spawn(move || {
-                                download_update_asset(&app_for_thread, url, file_name, size, digest, release_page);
+                                download_update_asset(&app_for_thread, url, file_name, size, digest, release_page, req);
                             });
+                        }
+                        ("install", Some(path)) => {
+                            // "重新安装" on a download that was already verified:
+                            // the file is on disk, so only the install/cleanup step
+                            // has to be redone. `may_install_from` keeps this from
+                            // becoming a "run any local executable" channel (see
+                            // its docs); the file NAME wins over the page's claim
+                            // when it names a real installer kind, because the name
+                            // is what decides how the file is executed.
+                            let target = std::path::PathBuf::from(&path);
+                            let kind_for_install = classify_asset(&path)
+                                .filter(|k| *k == "installer" || *k == "msi")
+                                .map(|k| k.to_string())
+                                .unwrap_or_else(|| kind.clone());
+                            let dir = download_dir();
+                            if may_install_from(&dir, &target, &kind_for_install) {
+                                log_line(&format!(
+                                    "update install: requested by banner -> {} ({kind_for_install})",
+                                    target.display()
+                                ));
+                                install_and_report(app_handle.clone(), target, kind_for_install, req.clone());
+                            } else {
+                                log_line(&format!(
+                                    "update install: refused {path} (kind {kind_for_install:?}) — not an installer this app downloaded"
+                                ));
+                                reveal_in_file_manager(&target);
+                                // Tell the banner, or its button would sit at
+                                // "安装中…" forever.
+                                let _ = app_handle.emit(
+                                    "dsh-update-progress",
+                                    serde_json::json!({
+                                        "state": "failed",
+                                        "message": format!(
+                                            "未自动安装：{} 不在「下载」文件夹内或不是安装包（已为你选中该文件，可重新下载）",
+                                            target.display()
+                                        ),
+                                        "file": Some(target.display().to_string()),
+                                        "req": req.as_str(),
+                                    }),
+                                );
+                            }
                         }
                         ("reveal", Some(path)) => {
                             // The banner's post-download shortcut: show the file
                             // that was just downloaded, selected in Explorer.
                             reveal_in_file_manager(std::path::Path::new(&path));
                         }
-                        ("download", _) => {
+                        ("download", Some(url)) => {
+                            // Not http(s), or a URL the update check never offered:
+                            // there is nothing this app is willing to fetch. The
+                            // banner is told so its button does not stay disabled.
+                            log_line(&format!(
+                                "update download: refused {url} (not an asset announced by the update check); opening the release page instead"
+                            ));
+                            open_url_in_browser(&release_page);
+                            let _ = app_handle.emit(
+                                "dsh-update-progress",
+                                serde_json::json!({
+                                    "state": "failed",
+                                    "message": "该地址不是更新检查提供的安装包（已为你打开 GitHub 发布页）",
+                                    "file": null,
+                                    "req": req.as_str(),
+                                }),
+                            );
+                        }
+                        ("download", None) => {
                             log_line("update download: no usable asset URL in the banner request; opening the release page instead");
                             open_url_in_browser(&release_page);
+                            let _ = app_handle.emit(
+                                "dsh-update-progress",
+                                serde_json::json!({
+                                    "state": "failed",
+                                    "message": "更新请求里没有可用的下载地址（已为你打开 GitHub 发布页）",
+                                    "file": null,
+                                    "req": req.as_str(),
+                                }),
+                            );
                         }
                         _ => {
                             log_line(&format!("update check: opening release page: {release_page}"));
@@ -4158,48 +4800,64 @@ mod update_download_tests {
 
     #[test]
     fn portable_build_prefers_the_portable_exe() {
-        let portable = asset_rank("portable", true, "DeepSeek-Harness_0.1.18_x64-portable.exe");
-        let setup = asset_rank("installer", true, "DeepSeek-Harness_0.1.18_x64-setup.exe");
-        let msi = asset_rank("msi", true, "a.msi");
+        let packaging = PackagingKind::Portable;
+        let portable = asset_rank("portable", packaging, "DeepSeek-Harness_0.1.18_x64-portable.exe");
+        let setup = asset_rank("installer", packaging, "DeepSeek-Harness_0.1.18_x64-setup.exe");
+        let msi = asset_rank("msi", packaging, "a.msi");
         assert!(portable < setup, "portable {portable} should win over setup {setup}");
         assert!(setup < msi);
     }
 
     #[test]
-    fn installed_build_prefers_the_nsis_setup() {
-        let portable = asset_rank("portable", false, "DeepSeek-Harness_0.1.18_x64-portable.exe");
-        let setup = asset_rank("installer", false, "DeepSeek-Harness_0.1.18_x64-setup.exe");
-        let msi = asset_rank("msi", false, "a.msi");
+    fn nsis_install_prefers_the_setup_exe() {
+        let packaging = PackagingKind::Nsis;
+        let portable = asset_rank("portable", packaging, "DeepSeek-Harness_0.1.18_x64-portable.exe");
+        let setup = asset_rank("installer", packaging, "DeepSeek-Harness_0.1.18_x64-setup.exe");
+        let msi = asset_rank("msi", packaging, "a.msi");
         assert!(setup < portable, "setup {setup} should win over portable {portable}");
         assert!(portable < msi);
     }
 
+    /// A copy installed from the MSI used to receive `...-setup.exe`: the ranking
+    /// only knew "installed", and always put the MSI last.
+    #[test]
+    fn msi_install_prefers_the_msi() {
+        let packaging = PackagingKind::Msi;
+        let msi = asset_rank("msi", packaging, "DeepSeek-Harness_0.1.18_x64_en-US.msi");
+        let setup = asset_rank("installer", packaging, "DeepSeek-Harness_0.1.18_x64-setup.exe");
+        let portable = asset_rank("portable", packaging, "DeepSeek-Harness_0.1.18_x64-portable.exe");
+        assert!(msi < setup, "msi {msi} should win over setup {setup}");
+        assert!(setup < portable, "setup {setup} should win over portable {portable}");
+
+        // …and the pick survives the release's own asset order.
+        let assets = collect_assets_for(&release_json(), packaging);
+        assert_eq!(assets[0].name, "DeepSeek-Harness_0.1.18_x64_en-US.msi");
+        assert_eq!(assets[0].kind, "msi");
+        assert_eq!(assets[0].digest, "sha256:aaa");
+    }
+
     #[test]
     fn x64_wins_over_unknown_arch() {
-        let x64 = asset_rank("portable", true, "DeepSeek-Harness_0.1.18_x64-portable.exe");
-        let unknown = asset_rank("portable", true, "DeepSeek-Harness_0.1.18-portable.exe");
+        let x64 = asset_rank("portable", PackagingKind::Portable, "DeepSeek-Harness_0.1.18_x64-portable.exe");
+        let unknown = asset_rank("portable", PackagingKind::Portable, "DeepSeek-Harness_0.1.18-portable.exe");
         assert!(x64 < unknown);
     }
 
     #[test]
     fn asset_list_is_filtered_and_ranked_for_this_build() {
-        let assets = collect_assets(&release_json());
+        // The packaging is injected, so this assertion no longer depends on what
+        // happens to be installed on the machine running the tests.
+        let assets = collect_assets_for(&release_json(), PackagingKind::Portable);
         assert_eq!(assets.len(), 3, "signatures and source archives must be dropped: {assets:?}");
-        let expected_lead = if running_portable() {
-            "DeepSeek-Harness_0.1.18_x64-portable.exe"
-        } else {
-            "DeepSeek-Harness_0.1.18_x64-setup.exe"
-        };
-        assert_eq!(assets[0].name, expected_lead);
-        // Whichever leads, the other build kind is second and the MSI last, so a
-        // shuffle in the release asset order cannot change the pick.
-        assert_ne!(assets[0].kind, "msi");
+        assert_eq!(assets[0].name, "DeepSeek-Harness_0.1.18_x64-portable.exe");
+        assert_eq!(assets[1].name, "DeepSeek-Harness_0.1.18_x64-setup.exe");
         assert_eq!(assets[2].kind, "msi");
         assert_eq!(assets[0].digest, "sha256:ccc");
         assert_eq!(assets[0].size, 7_000_000);
         assert!(assets.iter().all(|a| a.url.starts_with("https://")));
         assert_eq!(asset_kind_label("portable"), "免安装版");
         assert_eq!(asset_kind_label("installer"), "安装版（NSIS 安装包）");
+        assert_eq!(asset_kind_label("msi"), "安装版（MSI 安装包）");
     }
 
     #[test]
@@ -4207,7 +4865,7 @@ mod update_download_tests {
         // The anonymous API quota (60/h/IP) is easily exhausted behind a shared
         // or VPN address; the download must still be offered then.
         let endpoint = "https://github.com/ai-written/DeepSeek-Harness/releases/latest";
-        let assets = derived_assets(endpoint, "v0.1.18");
+        let assets = derived_assets_for(endpoint, "v0.1.18", PackagingKind::Nsis);
         assert_eq!(assets.len(), 3);
         let portable = assets.iter().find(|a| a.kind == "portable").unwrap();
         let installer = assets.iter().find(|a| a.kind == "installer").unwrap();
@@ -4219,19 +4877,251 @@ mod update_download_tests {
         );
         assert_eq!(installer.name, "DeepSeek-Harness_0.1.18_x64-setup.exe");
         assert_eq!(msi.name, "DeepSeek-Harness_0.1.18_x64_en-US.msi");
-        // Still ranked for this build, and sizes/digests are simply unknown.
-        let expected_lead = if running_portable() { "portable" } else { "installer" };
-        assert_eq!(assets[0].kind, expected_lead);
+        // Ranked for the injected build, with sizes/digests simply unknown.
+        assert_eq!(assets[0].kind, "installer");
         assert_eq!(assets[0].size, 0);
         assert!(assets[0].digest.is_empty());
+        assert_eq!(
+            derived_assets_for(endpoint, "v0.1.18", PackagingKind::Portable)[0].kind,
+            "portable"
+        );
+        assert_eq!(
+            derived_assets_for(endpoint, "v0.1.18", PackagingKind::Msi)[0].kind,
+            "msi"
+        );
         // A tag with an uppercase V or no prefix resolves to the same version.
-        assert_eq!(derived_assets(endpoint, "V0.1.18")[0].name.contains("0.1.18_"), true);
-        assert_eq!(derived_assets(endpoint, "0.1.18")[0].name.contains("0.1.18_"), true);
+        assert_eq!(
+            derived_assets_for(endpoint, "V0.1.18", PackagingKind::Portable)[0].name.contains("0.1.18_"),
+            true
+        );
+        assert_eq!(
+            derived_assets_for(endpoint, "0.1.18", PackagingKind::Portable)[0].name.contains("0.1.18_"),
+            true
+        );
         // A non-GitHub mirror has no derivable release path.
-        assert!(derived_assets("https://mirror.example.com/latest", "v1").is_empty());
+        assert!(derived_assets_for("https://mirror.example.com/latest", "v1", PackagingKind::Nsis).is_empty());
         // A tag that is not a version at all cannot name an asset.
-        assert!(derived_assets(endpoint, "v").is_empty());
-        assert!(derived_assets(endpoint, "latest").is_empty());
+        assert!(derived_assets_for(endpoint, "v", PackagingKind::Nsis).is_empty());
+        assert!(derived_assets_for(endpoint, "latest", PackagingKind::Nsis).is_empty());
+    }
+
+    /// One uninstall-registry row, built by hand so the tests never read the real
+    /// registry (and so they run unchanged on Linux/macOS).
+    fn record(
+        install_location: &str,
+        uninstall_string: &str,
+        windows_installer: bool,
+    ) -> UninstallRecord {
+        UninstallRecord {
+            display_name: "DeepSeek-Harness".to_string(),
+            install_location: install_location.to_string(),
+            display_icon: String::new(),
+            uninstall_string: uninstall_string.to_string(),
+            quiet_uninstall_string: String::new(),
+            windows_installer,
+        }
+    }
+
+    /// The reported bug: an app installed from the MSI kept being offered
+    /// `...-setup.exe` because a `uninstall.exe` next to it was read as "NSIS".
+    #[test]
+    fn an_msi_install_is_detected_even_with_an_adjacent_uninstaller() {
+        let exe = "C:\\Program Files\\DeepSeek-Harness\\deepseek-harness.exe";
+        // WiX/ARP writes InstallLocation from ARPINSTALLLOCATION, often with a
+        // trailing separator, and WindowsInstaller=1.
+        let msi = record("C:\\Program Files\\DeepSeek-Harness\\", "", true);
+        assert_eq!(
+            classify_packaging(exe, true, std::slice::from_ref(&msi)),
+            PackagingKind::Msi
+        );
+        // The msiexec uninstall command is the same signal when the flag is absent.
+        let msi_by_command = record("C:\\Program Files\\DeepSeek-Harness", "MsiExec.exe /X{1234}", false);
+        assert_eq!(classify_packaging(exe, false, &[msi_by_command]), PackagingKind::Msi);
+    }
+
+    /// An MSI install whose InstallLocation is missing is still recognisable from
+    /// DisplayIcon, which points into the same folder.
+    #[test]
+    fn display_icon_can_identify_the_install_folder() {
+        let exe = "C:\\Program Files\\DeepSeek-Harness\\deepseek-harness.exe";
+        let mut msi = record("", "", true);
+        msi.display_icon = "C:\\Program Files\\DeepSeek-Harness\\deepseek-harness.exe,0".to_string();
+        assert_eq!(classify_packaging(exe, false, &[msi]), PackagingKind::Msi);
+    }
+
+    #[test]
+    fn nsis_install_is_detected_from_its_record_or_its_uninstaller() {
+        let exe = "C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\\deepseek-harness.exe";
+        let nsis = record(
+            "C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness",
+            "\"C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\\uninstall.exe\"",
+            false,
+        );
+        assert_eq!(classify_packaging(exe, false, std::slice::from_ref(&nsis)), PackagingKind::Nsis);
+        // No registry evidence at all, but an uninstaller next to the exe (which
+        // the portable build never ships) is enough.
+        assert_eq!(classify_packaging(exe, true, &[]), PackagingKind::Nsis);
+    }
+
+    /// The standalone exe must stay standalone even when the same machine has an
+    /// installed copy — that is what made the wrong download appear.
+    #[test]
+    fn a_portable_copy_ignores_an_unrelated_install_record() {
+        let exe = "C:\\Users\\me\\Downloads\\DeepSeek-Harness_0.1.18_x64-portable.exe";
+        let other_install = record("C:\\Program Files\\DeepSeek-Harness", "MsiExec.exe /X{1234}", true);
+        assert_eq!(
+            classify_packaging(exe, false, std::slice::from_ref(&other_install)),
+            PackagingKind::Portable
+        );
+        // A record for a DIFFERENT product never counts either.
+        let mut foreign = record("C:\\Users\\me\\Downloads", "", true);
+        foreign.display_name = "Some Other App".to_string();
+        assert_eq!(classify_packaging(exe, false, &[foreign]), PackagingKind::Portable);
+        // No evidence at all: standalone.
+        assert_eq!(classify_packaging(exe, false, &[]), PackagingKind::Portable);
+    }
+
+    #[test]
+    fn windows_paths_are_compared_like_windows_does() {
+        assert_eq!(normalize_windows_path("C:\\Dir\\"), "c:\\dir");
+        assert_eq!(normalize_windows_path("C:/Dir"), "c:\\dir");
+        assert_eq!(normalize_windows_path("\"C:\\Dir\\App.exe\""), "c:\\dir\\app.exe");
+        assert_eq!(normalize_windows_path("C:\\Dir\\App.exe,0"), "c:\\dir\\app.exe");
+        assert_eq!(normalize_windows_path("\\\\?\\C:\\Dir\\App.exe"), "c:\\dir\\app.exe");
+        // A drive root survives normalization.
+        assert_eq!(normalize_windows_path("C:\\"), "c:\\");
+        assert_eq!(normalized_parent("c:\\dir\\app.exe"), "c:\\dir");
+        // A bare drive root is too weak to prove anything.
+        assert_eq!(normalized_parent("c:\\app.exe"), "");
+    }
+
+    #[test]
+    fn a_registry_command_is_a_command_line_not_a_path() {
+        assert_eq!(command_path("\"C:\\Dir\\uninstall.exe\" /S"), "C:\\Dir\\uninstall.exe");
+        assert_eq!(command_path("C:\\Dir\\uninstall.exe"), "C:\\Dir\\uninstall.exe");
+        // An unquoted command with arguments simply never matches a path.
+        assert_eq!(command_path("MsiExec.exe /X{1234}"), "MsiExec.exe /X{1234}");
+    }
+
+    #[test]
+    fn uninstall_registry_json_is_parsed_in_both_shapes() {
+        let rows = parse_uninstall_records(
+            r#"[{"displayName":"DeepSeek-Harness","installLocation":"C:\\App","displayIcon":"","uninstallString":"MsiExec.exe /X{1}","quietUninstallString":"","windowsInstaller":true}]"#,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].windows_installer);
+        assert_eq!(rows[0].install_location, "C:\\App");
+        // A single object (some PowerShell versions) and `[]` are both accepted.
+        assert_eq!(
+            parse_uninstall_records(r#"{"displayName":"DeepSeek-Harness"}"#).len(),
+            1
+        );
+        assert!(parse_uninstall_records("[]").is_empty());
+        assert!(parse_uninstall_records("").is_empty());
+        assert!(parse_uninstall_records("not json").is_empty());
+    }
+
+    /// The SHAPE of this fixture is the stdout the real registry query produced on
+    /// a Windows machine with an NSIS per-user install — including the literal
+    /// quotes Tauri's NSIS template writes into `InstallLocation`, `DisplayIcon`
+    /// and `UninstallString` (`"C:\…"`), which the matcher has to strip.
+    const REAL_NSIS_QUERY: &str = r#"[{"displayName":"DeepSeek-Harness","installLocation":"\"C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\"","displayIcon":"\"C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\\deepseek-harness.exe\"","uninstallString":"\"C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\\uninstall.exe\"","quietUninstallString":"","windowsInstaller":false}]"#;
+
+    #[test]
+    fn the_real_registry_shape_classifies_this_build() {
+        let rows = parse_uninstall_records(REAL_NSIS_QUERY);
+        assert_eq!(rows.len(), 1);
+        // The values really do keep their surrounding quotes after parsing.
+        assert_eq!(
+            rows[0].install_location,
+            "\"C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\""
+        );
+        assert!(!rows[0].windows_installer);
+        let exe = "C:\\Users\\me\\AppData\\Local\\DeepSeek-Harness\\deepseek-harness.exe";
+        assert_eq!(classify_packaging(exe, false, &rows), PackagingKind::Nsis);
+
+        // The same product installed by the MSI (WindowsInstaller=1) must be read
+        // as MSI — the reported bug was an MSI install downloading `setup.exe`.
+        // `uninstall.exe` next to the exe must not override that.
+        let as_msi = REAL_NSIS_QUERY.replace("\"windowsInstaller\":false", "\"windowsInstaller\":true");
+        let msi_rows = parse_uninstall_records(&as_msi);
+        assert_eq!(classify_packaging(exe, true, &msi_rows), PackagingKind::Msi);
+
+        // A portable copy elsewhere on the same machine stays portable.
+        assert_eq!(
+            classify_packaging("D:\\tools\\deepseek-harness.exe", false, &rows),
+            PackagingKind::Portable
+        );
+    }
+
+    /// The downloaded installer is deleted only after a real success; a cancelled
+    /// UAC prompt or a cancelled MSI keeps the file so the update can be retried.
+    #[test]
+    fn only_a_successful_install_may_delete_the_download() {
+        for ok in [0, 3010, 1641] {
+            assert!(installer_succeeded(ok), "{ok} is a success code");
+        }
+        // 2 is what Tauri's NSIS installer returns for `Abort`/`Quit` — both the
+        // "cancel the wizard" and the "don't close the running app" paths (measured
+        // against the generated installer.nsi/utils.nsh), so a cancellation is
+        // never mistaken for a completed install.
+        for keep in [1223, 1602, 2, 1, -1] {
+            assert!(!installer_succeeded(keep), "{keep} must keep the download");
+        }
+    }
+
+    /// Only an installer inside the download folder may be executed: that is what
+    /// keeps the banner's `mode:"install"` event from becoming a "run any local
+    /// executable you name" channel for the page.
+    #[test]
+    fn only_an_installer_in_the_download_folder_may_be_run() {
+        let dir = std::env::temp_dir().join("dsh-update-install-guard");
+        let other = std::env::temp_dir().join("dsh-update-install-guard-other");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let setup = dir.join("DeepSeek-Harness_0.1.21_x64-setup.exe");
+        let msi = dir.join("DeepSeek-Harness_0.1.21_x64_en-US.msi");
+        let portable = dir.join("DeepSeek-Harness_0.1.21_x64-portable.exe");
+        let outside = other.join("DeepSeek-Harness_0.1.21_x64-setup.exe");
+        for f in [&setup, &msi, &portable, &outside] {
+            std::fs::write(f, b"x").unwrap();
+        }
+
+        assert!(may_install_from(&dir, &setup, "installer"));
+        assert!(may_install_from(&dir, &msi, "msi"));
+        // A portable build is never run by the updater.
+        assert!(!may_install_from(&dir, &portable, "portable"));
+        // …nor is an installer sitting outside the download folder (an arbitrary
+        // path handed over by the page), nor one that is not there at all.
+        assert!(!may_install_from(&dir, &outside, "installer"));
+        assert!(!may_install_from(&dir, &dir.join("gone-setup.exe"), "installer"));
+        assert!(same_dir(&dir, &dir));
+        assert!(!same_dir(&dir, &other));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// The download (and the auto-install that follows) is limited to the assets
+    /// the update check itself announced.
+    #[test]
+    fn only_an_announced_asset_url_may_be_downloaded() {
+        let announced = "https://github.com/o/r/releases/download/v0.1.21/DeepSeek-Harness_0.1.21_x64-setup.exe";
+        let cache = Some(serde_json::json!({
+            "version": "v0.1.21",
+            "assets": [
+                {
+                    "name": "DeepSeek-Harness_0.1.21_x64-setup.exe",
+                    "url": announced,
+                    "kind": "installer"
+                },
+            ],
+        }));
+        assert!(is_announced_asset(&cache, announced));
+        assert!(!is_announced_asset(&cache, "https://evil.example.com/x-setup.exe"));
+        assert!(!is_announced_asset(&cache, ""));
+        assert!(!is_announced_asset(&None, announced));
     }
 
     #[test]
