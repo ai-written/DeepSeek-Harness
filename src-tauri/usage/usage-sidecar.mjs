@@ -138,12 +138,48 @@ function matchKeys(provider, model) {
   return keys;
 }
 
+const hasOwnKey = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+// Override rows are matched case-insensitively, because a model id reaches the
+// sidecar spelled exactly as the session log records it while the price row is
+// typed by hand — a row named "deepSeek-flash" must still price the model
+// "deepseek-flash" (and the same holds for both sides of "provider|model").
+// Precedence stays predictable: an exact key always wins, otherwise the first
+// row whose lowercased key matches is used, so rows that differ only by case
+// resolve deterministically (exact match first, then file order). The lowercase
+// index is memoized per loaded pricing object, which is rebuilt on every emit,
+// so edits still apply live.
+const lowerOverrideKeys = new WeakMap();
+function overrideKeysByLower(pricing) {
+  const rows = pricing.overrides;
+  if (!rows) return new Map();
+  let index = lowerOverrideKeys.get(rows);
+  if (!index) {
+    index = new Map();
+    for (const key of Object.keys(rows)) {
+      const lower = key.toLowerCase();
+      if (!index.has(lower)) index.set(lower, key);
+    }
+    lowerOverrideKeys.set(rows, index);
+  }
+  return index;
+}
+
+/// The override row for one match key, or undefined when no row applies.
+function overrideRow(pricing, key) {
+  const rows = pricing.overrides;
+  if (!rows) return undefined;
+  if (hasOwnKey(rows, key)) return rows[key];
+  const actual = overrideKeysByLower(pricing).get(key.toLowerCase());
+  return actual === undefined ? undefined : rows[actual];
+}
+
 function resolvePrice(pricing, provider, model) {
   const out = {};
   for (const k of PRICE_KEYS) {
     out[k] = pricing.default?.[k] ?? 0;
     for (const key of matchKeys(provider, model)) {
-      const row = pricing.overrides?.[key];
+      const row = overrideRow(pricing, key);
       if (row && row[k] != null) {
         out[k] = row[k];
         break;
@@ -157,7 +193,7 @@ function resolvePrice(pricing, provider, model) {
 // otherwise the global one.
 function modelTimeOfUse(pricing, provider, model) {
   for (const k of matchKeys(provider, model)) {
-    const row = pricing.overrides?.[k];
+    const row = overrideRow(pricing, k);
     if (row && row.timeOfUse) return row.timeOfUse;
   }
   return pricing.timeOfUse;
@@ -167,7 +203,7 @@ function modelTimeOfUse(pricing, provider, model) {
 // otherwise the global `multiplier`, default 1).
 function modelMultiplier(pricing, provider, model) {
   for (const k of matchKeys(provider, model)) {
-    const row = pricing.overrides?.[k];
+    const row = overrideRow(pricing, k);
     if (row && row.multiplier != null) return row.multiplier;
   }
   return pricing.multiplier ?? 1;
@@ -178,7 +214,7 @@ function modelMultiplier(pricing, provider, model) {
 // tokens are strictly above its threshold.
 function modelContextMultiplier(pricing, provider, model) {
   for (const k of matchKeys(provider, model)) {
-    const row = pricing.overrides?.[k];
+    const row = overrideRow(pricing, k);
     if (row && row.contextMultiplier != null) return row.contextMultiplier;
   }
   return pricing.contextMultiplier;
@@ -188,7 +224,7 @@ function modelContextMultiplier(pricing, provider, model) {
 // row first), otherwise the default row's currency, defaulting to CNY.
 function resolveCurrency(pricing, provider, model) {
   for (const k of matchKeys(provider, model)) {
-    const row = pricing.overrides?.[k];
+    const row = overrideRow(pricing, k);
     if (row && row.currency) return row.currency;
   }
   return pricing.default?.currency || "cny";

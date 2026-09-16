@@ -24,6 +24,7 @@ npm run build    # 打包 release
 ## 特性
 
 - **即开即见**：窗口先显示带进度提示的占位页，dsh 就绪后自动切换到实际界面，冷启动不"黑屏"
+- **不会退回启动页**：进入实际界面后，一切**回启动页**的历史导航都被拒绝——鼠标侧键（后退 / 前进）、`Alt+←/→`、`Backspace` 都算在内（日志记 `navigation to the startup page refused`），窗口始终停在 dsh 界面上；启动页在 dsh 就绪之前仍可正常加载与重载，界面内的页内路由不受影响
 - **共享配置**：不注入 DSH_HOME，桌面版与 CLI 共用同一套配置/会话/凭据（`~/.dsh`）
 - **无边框窗口**：默认自定义标题栏（最小化 / 最大化 / 关闭），支持拖拽；可配置切换系统原生标题栏（见「配置」）
 - **无控制台闪窗**：直接 spawn `node.exe`，不弹 cmd 窗口
@@ -123,12 +124,12 @@ npm run build
 
 主窗口左下角的「¥X.XX」胶囊显示当天使用 dsh 的估算费用（人民币），实时刷新；点击可查看当日 24 小时 / 近 7 日 / 近 30 日 / 近 12 个月用量图表（含金额、token、请求数、缓存命中率合计），可按会话日志中的 `provider` 字段筛选供应商，并编辑汇率与单价。
 
-- **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 `session.jsonl(.zstd)` 和 `session.vN.jsonl(.zstd)` 版本格式），按 `provider` / 模型分桶并每 3 秒增量刷新；统计缓存保存于 `~/.dsh/storages/usage-cache.json`，启动先读取缓存，只重算新增或变化的日志，删除日志时保留缓存中的历史统计；打开用量弹窗时暂停轮询，以弹窗打开瞬间的数据为准，关闭后立即恢复；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染。回归验证：`node src-tauri/usage/context-tier.verify.mjs`（上下文倍率端到端）与 `node src-tauri/usage/context-tier.v1migration.verify.mjs`（缓存 v1→v2 迁移）
+- **实现**：壳额外 spawn 一个 node sidecar（`src-tauri/usage/usage-sidecar.mjs`），折叠 `~/.dsh/sessions` 会话日志（支持 `session.jsonl(.zstd)` 和 `session.vN.jsonl(.zstd)` 版本格式），按 `provider` / 模型分桶并每 3 秒增量刷新；统计缓存保存于 `~/.dsh/storages/usage-cache.json`，启动先读取缓存，只重算新增或变化的日志，删除日志时保留缓存中的历史统计；打开用量弹窗时暂停轮询，以弹窗打开瞬间的数据为准，关闭后立即恢复；Rust 侧将数据转发为 `dsh-usage` 事件，页面内注入的 `src-tauri/usage-panel.js` 监听并渲染。回归验证：`node src-tauri/usage/context-tier.verify.mjs`（上下文倍率端到端）、`node src-tauri/usage/context-tier.v1migration.verify.mjs`（缓存 v1→v2 迁移）与 `node src-tauri/usage/pricing-key-case.verify.mjs`（价格行键名大小写不敏感）
 - **价格配置**：`~/.dsh/storages/usage-pricing.json`（`exchangeRate` / `default` / `overrides`），支持按模型倍率、上下文长度档位与峰时时段计价；sidecar 每次刷新重读，改动即时生效
 - **上下文倍率**：`contextMultiplier` 可写在顶层（默认行，作用于所有未单独配置的模型）或某个 override 行；字段形如 `{ "threshold": 64000, "multiplier": 1.5 }`。`threshold` 单位为 **token**，可为裸数字或带 `K`/`M`/`B` 后缀的字符串（大小写不限、可带小数与空格，如 `"128K"`、`"1.5M"`、`"2B"`）；界面与配置文件都支持该写法，**保存时按输入的紧凑形式原样保留（纯数字则存数值），仅在内部计价时换算成 token 数**，避免界面显示一长串大数字。某次请求的「上下文长度」按该请求的输入 token（未缓存输入 + 缓存读取 + 缓存写入）计，**严格大于 `threshold`** 时，本次请求的输入与输出费用整体乘以 `multiplier`（留空/缺省 = 不启用，保持原价；`multiplier` 需为正数）。sidecar 缓存每次请求的原始用量，改阈值或倍率后历史金额会随刷新重算
 - **计价单位**：`default.currency` 与各 override 行的 `currency` 可选 `"cny"`（人民币，缺省）或 `"usd"`（美元）；旧配置缺省该字段时按人民币计
 - **合计币种**：顶层 `totalCurrency` 可选 `"cny"`（缺省）或 `"usd"`，决定所有金额合计的币种；各行价格按计价单位换算到合计币种，**计价单位与合计币种一致时不经汇率**（全部按人民币计价时无需汇率换算）；徽标与图表始终以人民币显示
-- **单价匹配优先级**：`overrides` 的键支持 `模型名`、`provider|模型名`、`provider|*`、`*|模型名` 四种写法；逐价格字段按「纯模型名 > `provider|模型名` > `provider|*` > `*|模型名`」取最高优先级匹配，高优先级行未定义的字段由低优先级行补全（同一键只保留一行，界面保存时会拒绝重复键）
+- **单价匹配优先级**：`overrides` 的键支持 `模型名`、`provider|模型名`、`provider|*`、`*|模型名` 四种写法；逐价格字段按「纯模型名 > `provider|模型名` > `provider|*` > `*|模型名`」取最高优先级匹配，高优先级行未定义的字段由低优先级行补全（同一键只保留一行，界面保存时会拒绝重复键）；**键名匹配不区分大小写**（`provider|模型名` 的两侧同样如此），因此手工书写的键名与网关/日志里的模型 id 大小写不一致也能命中。精确匹配优先：同时存在 `deepSeek-flash` 与 `deepseek-flash` 两行时，与模型 id 逐字符相同的那行生效；若都没有精确命中，仅在大小写上不同的多行之间按配置文件中的先后顺序取第一行
 
 峰时档位（`timeOfUse`）可选字段 `days` 限定峰时适用日期，缺省 `all`（每天，行为与旧版一致）：
 

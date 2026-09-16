@@ -116,6 +116,15 @@ fn log_line(msg: &str) {
 struct HarnessState {
     child: Mutex<Option<Child>>,
     pid: Mutex<Option<u32>>,
+    /// Set the moment the window is sent to the harness URL. The placeholder
+    /// page is a legal destination only until then — a launch that never
+    /// yields a URL does not reach this point, so the error page's 重试启动
+    /// keeps working. Afterwards every navigation back to it — the mouse's
+    /// back/forward button (XButton1/2), Alt+Left/Right, Backspace, or a stray
+    /// script — is refused, so the user cannot be dropped back onto the
+    /// startup page while dsh keeps running behind it. See the `on_navigation`
+    /// handler on the main window.
+    harness_reached: std::sync::atomic::AtomicBool,
 }
 
 /// The usage sidecar child (the badge's data source). Kept so it is killed on
@@ -3833,6 +3842,32 @@ fn pricing_write(pricing: &str) -> String {
     }
 }
 
+/// Whether a URL is the bundled placeholder ("startup") page.
+///
+/// The placeholder is served by the app's own asset protocol, never by an HTTP
+/// server: on Windows the document URL is `http://tauri.localhost/` and on
+/// macOS/Linux it is `tauri://localhost/` (both visible as the `page load
+/// started:` lines in startup.log). The trailing `/index.html` test also
+/// matches an explicit asset path. The harness page is a loopback URL
+/// (`http://127.0.0.1:<port>/…`), which matches none of these.
+fn is_placeholder_url(url: &tauri::Url) -> bool {
+    url.scheme() == "tauri"
+        || url.host_str() == Some("tauri.localhost")
+        || url.path().ends_with("/index.html")
+}
+
+/// Whether a navigation to `target` must be refused.
+///
+/// The startup page is a legal destination only while the harness UI has not
+/// been reached yet (its own first load, and a reload after a failed launch).
+/// Once the window has been sent to the harness URL, navigating back to it is
+/// always a history traversal the user did not ask for — the mouse's back
+/// button, Alt+Left, Backspace — so it is refused and the harness page stays
+/// where it is.
+fn refuses_navigation(harness_reached: bool, target: &tauri::Url) -> bool {
+    harness_reached && is_placeholder_url(target)
+}
+
 /// Spawn dsh, wait for its URL and navigate the window — the whole launch, on its
 /// own thread. Used for the initial start and for the error page's 重试启动.
 ///
@@ -3894,6 +3929,12 @@ fn start_harness(
             Ok(url) => {
                 log_line(&format!("harness ready: {url}; navigating"));
                 emit_startup(&handle, "info", "ready", "服务已就绪，正在加载界面…");
+                // Flag this before the navigation is issued, so a back press
+                // during the page load cannot win the race and land the window
+                // back on the startup page.
+                state
+                    .harness_reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Some(window) = handle.get_webview_window("main") {
                     match window.navigate(url.parse().expect("loopback url")) {
                         Ok(()) => log_line("window.navigate() accepted"),
@@ -3960,6 +4001,7 @@ fn main() {
             let state = Arc::new(HarnessState {
                 child: Mutex::new(None),
                 pid: Mutex::new(None),
+                harness_reached: std::sync::atomic::AtomicBool::new(false),
             });
             app.manage(state.clone());
 
@@ -4634,6 +4676,31 @@ fn main() {
             if let Some(panel_js) = usage_panel_js {
                 window_builder = window_builder.initialization_script(panel_js);
             }
+            // Refuse navigation back to the startup page once the harness UI
+            // has been reached.
+            //
+            // WebView2 raises NavigationStarting for every navigation the user
+            // can trigger — the mouse's back/forward buttons (XButton1/2),
+            // Alt+Left/Right and Backspace included — and wry cancels the
+            // navigation when this handler returns false. Without it, a single
+            // press of the mouse back button walks the window's history one
+            // entry back onto the placeholder page while dsh keeps running
+            // behind it; the placeholder then looks like a fresh startup (its
+            // step indicator resets, 重试启动 refuses because the harness page
+            // is no longer current) and there is no way forward again. The
+            // harness page itself is untouched: it is a loopback URL, and
+            // in-app (pushState) history stays entirely inside the page.
+            let nav_state = state.clone();
+            window_builder = window_builder.on_navigation(move |url| {
+                let reached = nav_state
+                    .harness_reached
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if refuses_navigation(reached, url) {
+                    log_line(&format!("navigation to the startup page refused: {url}"));
+                    return false;
+                }
+                true
+            });
             let update_cache_load = update_cache.clone();
             let update_app_load = app.handle().clone();
             let usage_state_load = usage_state.clone();
@@ -4709,11 +4776,7 @@ fn main() {
                     let on_placeholder = retry_app
                         .get_webview_window("main")
                         .and_then(|w| w.url().ok())
-                        .map(|url| {
-                            // The placeholder is the bundled app URL (tauri://…/index.html);
-                            // the harness page is the loopback dsh URL.
-                            url.scheme() == "tauri" || url.path().ends_with("/index.html")
-                        })
+                        .map(|url| is_placeholder_url(&url))
                         .unwrap_or(false);
                     if !on_placeholder {
                         log_line("retry start ignored: the harness page is already loaded");
@@ -5122,6 +5185,55 @@ mod update_download_tests {
         assert!(!is_announced_asset(&cache, "https://evil.example.com/x-setup.exe"));
         assert!(!is_announced_asset(&cache, ""));
         assert!(!is_announced_asset(&None, announced));
+    }
+
+    /// The startup page must be out of reach once the harness UI is up. WebView2
+    /// delivers the mouse back/forward buttons, Alt+Left/Right and Backspace as
+    /// ordinary navigations, so this predicate is the only thing between the
+    /// user and a history jump back onto the placeholder.
+    ///
+    /// The URL forms below are the ones actually observed in startup.log, not
+    /// guessed ones: Windows loads the placeholder as `http://tauri.localhost/`
+    /// — with no `/index.html` suffix — so a predicate keyed on the path alone
+    /// silently matches nothing and the guard never fires.
+    #[test]
+    fn the_startup_page_is_off_limits_once_the_harness_is_up() {
+        let parse = |s: &str| tauri::Url::parse(s).expect("valid test url");
+
+        const PLACEHOLDER: &str = "http://tauri.localhost/"; // the real Windows form
+        const HARNESS: &str = "http://127.0.0.1:58923/"; // the real harness form
+
+        for url in [
+            PLACEHOLDER,
+            "https://tauri.localhost/",
+            "tauri://localhost/",     // macOS / Linux asset protocol
+            "http://tauri.localhost/index.html", // explicit asset path
+            "tauri://localhost/index.html",
+        ] {
+            assert!(is_placeholder_url(&parse(url)), "{url} is the placeholder");
+        }
+        // The harness page — with and without dsh's `?token=` — is not.
+        for url in [
+            HARNESS,
+            "http://127.0.0.1:58923/?token=abc",
+            "http://127.0.0.1:58923/session/abc",
+        ] {
+            assert!(!is_placeholder_url(&parse(url)), "{url} is the harness page");
+        }
+
+        // Before the harness is reached the placeholder is legitimately
+        // reachable — its own first load, and a reload after a failed start...
+        assert!(!refuses_navigation(false, &parse(PLACEHOLDER)));
+        assert!(!refuses_navigation(false, &parse("tauri://localhost/")));
+        // ...afterwards it is refused, while the harness page stays navigable.
+        assert!(refuses_navigation(true, &parse(PLACEHOLDER)));
+        assert!(refuses_navigation(true, &parse("tauri://localhost/")));
+        assert!(!refuses_navigation(true, &parse(HARNESS)));
+        assert!(!refuses_navigation(true, &parse("http://127.0.0.1:58923/?token=abc")));
+
+        // The retry button's "am I still on the startup page?" test rides on the
+        // same predicate, so it must answer yes while the placeholder is shown.
+        assert!(is_placeholder_url(&parse(PLACEHOLDER)));
     }
 
     #[test]
