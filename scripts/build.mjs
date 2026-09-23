@@ -1,17 +1,9 @@
-// build.mjs — npm run build wrapper that injects the updater signing key.
+// build.mjs — `npm run build` wrapper.
 //
-// `tauri build` signs updater artifacts when createUpdaterArtifacts is on.
-// Instead of requiring TAURI_SIGNING_PRIVATE_KEY to be set in the system
-// environment (registry write, easy to forget), this script loads the key
-// from .tauri/deepseek-harness.key and the optional password from
-// .tauri/key-password.txt (both gitignored) and forwards them to the child
-// process.
-//
-// If the private key is NOT password-protected, leave key-password.txt
-// absent/empty. If you regenerate the keypair (tauri signer generate), the
-// .pub must be copied into tauri.conf.json -> plugins.updater.pubkey.
+// Two jobs: sync the version (package.json is the single source of truth) and
+// then run `tauri build`. Nothing else — this shell ships no updater, so there
+// is no signing key to inject and no updater artifacts to produce.
 
-import { readFileSync, existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -24,16 +16,6 @@ try {
   syncVersion()
 } catch (e) {
   console.warn(`[sync-version] failed: ${e.message}`)
-}
-
-const keyPath = path.join(root, '.tauri', 'deepseek-harness.key')
-const pwPath = path.join(root, '.tauri', 'key-password.txt')
-
-if (existsSync(keyPath)) {
-  process.env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(keyPath, 'utf8').trim()
-}
-if (!process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD && existsSync(pwPath)) {
-  process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = readFileSync(pwPath, 'utf8').replace(/\r?\n$/, '')
 }
 
 const child = spawn('tauri', ['build'], {

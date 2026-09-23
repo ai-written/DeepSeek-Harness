@@ -29,31 +29,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Fail fast (before any toolchain/build work) with a clear message when
-      # the updater signing secret is missing or malformed. Without it
-      # tauri-action builds with an empty TAURI_SIGNING_PRIVATE_KEY and fails
-      # deep inside the bundler (or hangs waiting for a key), which is painful
-      # to debug. Step-level `if` cannot read the `secrets` context, so the
-      # value is passed through `env` and checked in the script instead.
-      - name: Check TAURI_SIGNING_PRIVATE_KEY secret is configured
-        shell: pwsh
-        env:
-          DSH_SIGN_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          $key = $env:DSH_SIGN_KEY
-          if ([string]::IsNullOrEmpty($key)) {
-            Write-Error "❌ Missing secret: TAURI_SIGNING_PRIVATE_KEY 未配置，无法构建更新包。`n`n修复：`n  1. 打开仓库 Settings → Secrets and variables → Actions → New repository secret。`n  2. Name 填 TAURI_SIGNING_PRIVATE_KEY。`n  3. Value 填本机 .tauri\deepseek-harness.key 的完整内容（Get-Content .tauri\deepseek-harness.key -Raw），私钥勿外泄。"
-            exit 1
-          }
-          # A minisign secret key is a ~460-char base64 blob; tolerate
-          # surrounding whitespace (e.g. a trailing newline from -Raw).
-          $trimmed = $key.Trim()
-          if ($trimmed.Length -lt 100 -or $trimmed -match '[^A-Za-z0-9+/=]') {
-            Write-Error "TAURI_SIGNING_PRIVATE_KEY 内容看起来不是有效的 minisign 私钥（长度 $($trimmed.Length)）。请用 .tauri\deepseek-harness.key 的完整内容重新配置。"
-            exit 1
-          }
-          Write-Host "TAURI_SIGNING_PRIVATE_KEY looks OK (length $($trimmed.Length))."
-
       # Linux-only system deps (needed if you add ubuntu-latest to the matrix).
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-latest'
@@ -96,14 +71,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Installer/updater signing. Add the private key as a repository
-          # secret `TAURI_SIGNING_PRIVATE_KEY` (value: the full private key
-          # string from `.tauri/deepseek-harness.key`). The key is passwordless
-          # (generated with an empty password), so the password env var must be
-          # set to an empty string — otherwise the CLI waits for an interactive
-          # prompt and the CI build hangs.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DeepSeek-Harness ${{ github.ref_name }}"

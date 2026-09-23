@@ -1,14 +1,12 @@
 // window-controls.js — custom titlebar controls injected into the harness
-// page. By default the native decorations are off (decorations: false) and
-// this script renders minimize / maximize / close buttons pinned to the
-// top-right of the page plus a drag region, talking to the Tauri window
-// through the global API (withGlobalTauri: true + window permissions in
-// capabilities).
+// page. The window is built without native decorations, so this script renders
+// minimize / maximize / close buttons pinned to the top-right of the page plus
+// a drag region, talking to the Tauri window through the global API
+// (withGlobalTauri: true + window permissions in capabilities).
 //
-// When desktop-settings.json sets "decorations": true, main.rs uses the
-// native system titlebar instead and prepends
-// `window.__deepseekHarnessNativeDecorations = true;` to this script, which
-// skips the custom caption bar but keeps the startup-progress forwarding.
+// It also owns the shell's only other page-side job: forwarding the Rust-side
+// `dsh-startup` progress to the placeholder page, and offering 重试启动 /
+// 打开日志 when the launch failed.
 //
 // Injected with WebviewWindowBuilder::initialization_script so it runs before
 // the page scripts on every navigation (placeholder and harness pages).
@@ -29,14 +27,6 @@
   }
   const appWindow = Tauri.window.getCurrentWindow()
 
-  // Native system titlebar (desktop-settings.json "decorations": true): skip
-  // the custom caption bar below; only the startup-progress forwarding stays.
-  const NATIVE = !!window.__deepseekHarnessNativeDecorations
-  let bar = null
-  // Header-utilities nudge <style>; created only for the custom titlebar
-  // (below) but appended from mount(), so it lives in this outer scope.
-  let nudgeStyle = null
-
   // Decide whether the caption buttons need dark icons (light page) or light
   // icons (dark page) by sampling the page's actual background luminance.
   // The harness page theme is unknown at build time, so never assume it is
@@ -56,13 +46,12 @@
     return false
   }
 
-  if (!NATIVE) {
   const BAR_HEIGHT = 26
   const BTN_W = 46
 
   // Container pinned to the top of the page. It must float above the harness
   // UI, so use a high z-index. Pointer events on the bar drag the window.
-  bar = document.createElement('div')
+  const bar = document.createElement('div')
   bar.id = 'deepseek-harness-titlebar'
   bar.style.cssText =
     'position:fixed;top:0;left:0;right:0;height:' + BAR_HEIGHT + 'px;' +
@@ -89,11 +78,12 @@
   // make the strip's bottom overlap the pane body and leave the lower part
   // of the strip's buttons covered and unclickable. A margin moves the strip
   // AND the pane body after it down in flow, so nothing overlaps.
-  nudgeStyle = document.createElement('style')
+  const nudgeStyle = document.createElement('style')
   nudgeStyle.id = 'deepseek-harness-header-nudge'
   nudgeStyle.textContent =
     '[class*="headerUtilities"],[data-conversation-header-corner]{position:relative !important;top:18px !important;}' +
     '[class*="tabStrip"]{margin-top:18px !important;}'
+
   // Drag region: left part of the bar (buttons stay interactive on the right).
   const drag = document.createElement('div')
   drag.style.cssText =
@@ -179,30 +169,36 @@
   if (Tauri.event) {
     Tauri.event.listen('tauri://resize', refreshMaxIcon).catch(() => {})
   }
-  } // end: custom titlebar (skipped under native decorations)
 
-  // ── WebView2 store self-healing ──────────────────────────────────────────
-  // A stale/corrupt WebView2 user-data store can make this page fail to load
-  // the harness's client-plugin bundles ("Failed to load plugins" /
-  // `client-modules: bundle script … failed to load`), and it then stays broken
-  // on every reload and every launch. The store cannot be cleared in place (the
-  // bad state also lives in the running WebView2 process, and its files are in
-  // use), so report the failure to the Rust side, which records a reset for the
-  // next launch and relaunches the app once.
+  function emit(name, payload) {
+    try {
+      if (Tauri.event && Tauri.event.emit) Tauri.event.emit(name, payload).catch(() => {})
+    } catch {
+      /* noop */
+    }
+  }
+
+  // ── client-plugin bundle load failure ───────────────────────────────────────
+  // A stale/corrupt WebView2 store makes this page fail to load the harness's
+  // client-plugin bundles ("Failed to load plugins" / `client-modules: bundle
+  // script … failed to load`), and it then stays broken on every reload and
+  // every launch. The store cannot be cleared in place either (the bad state
+  // also lives in the running WebView2 process, and its files are in use), so
+  // the shell does NOT try to fix it automatically: this detector reports the
+  // failure to the Rust side (one line in the startup log) and shows the user
+  // which directory to delete after quitting.
   //
   // Detection keys on the failure MECHANISM, not on error text: a <script>
   // whose /plugins bundle failed to load (resource load errors do not bubble,
   // hence the capture phase), plus dsh's own `client-modules:` prefix on an
   // unhandled rejection as a second signal.
-  let webviewBrokenReported = false
-  function reportWebviewBroken(source, detail) {
-    if (webviewBrokenReported) return
-    webviewBrokenReported = true
-    if (!Tauri.event || !Tauri.event.emit) return
-    console.warn('[deepseek-harness] reporting broken webview:', source, detail)
-    Tauri.event
-      .emit('dsh-webview-broken', { source, detail: String(detail).slice(0, 2000) })
-      .catch(() => {})
+  let pluginFailureReported = false
+  function reportPluginFailure(source, detail) {
+    if (pluginFailureReported) return
+    pluginFailureReported = true
+    console.warn('[deepseek-harness] client plugin bundle failed to load:', source, detail)
+    emit('dsh-webview-broken', { source, detail: String(detail).slice(0, 2000) })
+    showPluginFailureNotice()
   }
   window.addEventListener(
     'error',
@@ -214,7 +210,7 @@
         typeof target.src === 'string' &&
         target.src.indexOf('/plugins/') !== -1
       ) {
-        reportWebviewBroken('script', target.src)
+        reportPluginFailure('script', target.src)
       }
     },
     true
@@ -223,9 +219,73 @@
     const reason = e.reason
     const message = (reason && (reason.message || String(reason))) || ''
     if (message.indexOf('client-modules:') !== -1 || message.indexOf('Failed to load plugins') !== -1) {
-      reportWebviewBroken('rejection', message)
+      reportPluginFailure('rejection', message)
     }
   })
+
+  // Non-blocking notice pinned to the bottom of the page: the harness UI stays
+  // usable, so the user can read what to do and keep working until they quit.
+  function showPluginFailureNotice() {
+    if (!document.body) {
+      document.addEventListener('DOMContentLoaded', showPluginFailureNotice, { once: true })
+      return
+    }
+    const id = 'deepseek-harness-plugin-failure'
+    if (document.getElementById(id)) return
+
+    const dir = window.__deepseekHarnessWebviewDir || '（路径见启动日志 startup.log 里的 webview data dir 行）'
+    const box = document.createElement('div')
+    box.id = id
+    box.style.cssText =
+      'position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:2147483647;' +
+      'max-width:min(720px,92vw);box-sizing:border-box;padding:12px 14px;border-radius:12px;' +
+      'background:#fff8f0;border:1px solid #e0b072;box-shadow:0 10px 30px rgba(0,0,0,0.18);' +
+      'color:#5c3b12;text-align:left;user-select:text;' +
+      'font:12.5px/1.7 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;'
+
+    const heading = document.createElement('div')
+    heading.textContent = '客户端插件加载失败'
+    heading.style.cssText = 'margin-bottom:4px;font-size:13.5px;font-weight:700;'
+    box.appendChild(heading)
+
+    const body = document.createElement('div')
+    body.textContent =
+      '界面可能缺少部分功能（例如用量徽标），刷新无效。这通常是 WebView2 缓存目录损坏导致的：' +
+      '退出应用后删掉下面这个目录，再重新打开即可。'
+    box.appendChild(body)
+
+    const pathEl = document.createElement('code')
+    pathEl.textContent = dir
+    pathEl.style.cssText =
+      'display:block;margin:7px 0 9px;padding:5px 8px;border-radius:6px;user-select:all;' +
+      'background:rgba(92,59,18,0.08);word-break:break-all;' +
+      'font-family:ui-monospace,"Cascadia Mono",Consolas,monospace;font-size:11.5px;'
+    box.appendChild(pathEl)
+
+    const actions = document.createElement('div')
+    actions.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;'
+    const mkBtn = (text, primary, onclick) => {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.textContent = text
+      b.style.cssText =
+        'padding:5px 12px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;' +
+        (primary
+          ? 'border:none;background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;'
+          : 'border:1px solid #d0a06a;background:#fff;color:#5c3b12;')
+      b.onclick = onclick
+      return b
+    }
+    actions.appendChild(mkBtn('打开日志', true, () => emit('dsh-open-startup-log', {})))
+    actions.appendChild(
+      mkBtn('知道了', false, () => {
+        box.remove()
+      }),
+    )
+    box.appendChild(actions)
+
+    document.body.appendChild(box)
+  }
 
   // Forward Rust-side startup progress to the placeholder page
   // (#dsh-startup-status and the step indicator in #startup-steps). No-op on
@@ -234,8 +294,7 @@
   // before the DOM is ready, so remember the latest message and replay it on
   // mount.
   let lastStartup = null
-  // True once dsh reported ready: from then on the recovery controls are hidden
-  // (the normal dialog is reachable from the badge).
+  // True once dsh reported ready: from then on the recovery controls are hidden.
   let serviceReady = false
   if (Tauri.event) {
     Tauri.event
@@ -250,8 +309,8 @@
   }
 
   // ── recovery controls (startup page only) ───────────────────────────────────
-  // Visible while booting and after a failure; the container id keeps it off the
-  // harness page (window-controls.js runs there too).
+  // Visible while booting and after a failure; the container id keeps it off
+  // the harness page (this script runs there too).
   function showRecoveryControls(visible) {
     const panel = document.getElementById('startup-panel')
     if (!panel) return
@@ -280,22 +339,10 @@
         return b
       }
 
-      // Straight to the version dialog: switch back to a version that starts.
-      box.appendChild(
-        mkBtn('切换 dsh 版本', true, () => {
-          if (typeof window.__deepseekHarnessOpenVersions === 'function') {
-            window.__deepseekHarnessOpenVersions()
-          } else {
-            // The panel script could not load (or the badge was disabled): at least
-            // put the version directory on screen so the user can act manually.
-            emit('dsh-reveal-versions-dir', {})
-          }
-        }),
-      )
       // Retry without restarting: cheap, and enough when the failure was
       // transient (a cold-start timeout, a port clash, an antivirus delay).
       box.appendChild(
-        mkBtn('重试启动', false, () => {
+        mkBtn('重试启动', true, () => {
           const status = document.getElementById('dsh-startup-status')
           if (status) {
             status.textContent = '正在重试启动 dsh…'
@@ -308,7 +355,7 @@
 
       const hint = document.createElement('div')
       hint.style.cssText = 'width:100%;font-size:11.5px;color:#8b949e;text-align:center;'
-      hint.textContent = '切换版本后可在此重试启动，或点版本对话框里的「重启应用」。'
+      hint.textContent = '启动失败时先点「重试启动」；仍失败则点「打开日志」看具体原因。'
       box.appendChild(hint)
 
       const insertAfter = document.getElementById('dsh-startup-status') || panel.lastElementChild
@@ -319,14 +366,6 @@
       }
     }
     box.style.display = 'flex'
-  }
-
-  function emit(name, payload) {
-    try {
-      if (Tauri.event && Tauri.event.emit) Tauri.event.emit(name, payload).catch(() => {})
-    } catch {
-      /* noop */
-    }
   }
 
   // Map of startup stages (sent by main.rs) to step indices. Falls back to
@@ -356,10 +395,8 @@
     const panel = document.getElementById('startup-panel')
     if (panel) panel.classList.toggle('has-error', isError)
     // Recovery controls: shown while the shell is still booting and kept on
-    // screen after a failure. A selected dsh version that cannot start is the one
-    // failure with no in-page escape otherwise — the harness page (and with it
-    // the version tab and the usage dialog) is never reached, which would leave
-    // hand-editing dsh-versions.json as the only way back.
+    // screen after a failure, so a launch that never yields a URL is still
+    // escapable from the page.
     showRecoveryControls(isError || !serviceReady)
 
     const steps = document.getElementById('startup-steps')
@@ -393,24 +430,22 @@
 
   // Append on DOMContentLoaded if the document is still loading, else now.
   function mount() {
-    if (!NATIVE) {
-      if (!document.getElementById('deepseek-harness-titlebar')) {
-        document.body.appendChild(bar)
-        // Push harness content down so it isn't hidden under the transparent
-        // bar's drag strip; the buttons themselves sit on top of content.
-      }
-      // Drop the header-utilities nudge style (idempotent per document).
-      if (!document.getElementById('deepseek-harness-header-nudge')) {
-        document.head.appendChild(nudgeStyle)
-      }
-      // Initial caption-button color: match the page's actual background
-      // luminance (light page → dark icons, dark page → light icons).
-      const light = pageIsLight()
-      const fg = light ? '#57606a' : '#c9d1d9'
-      bar.querySelectorAll('.dsh-caption-btn').forEach((b) => {
-        b.style.color = fg
-      })
+    if (!document.getElementById('deepseek-harness-titlebar')) {
+      document.body.appendChild(bar)
+      // The bar is transparent and sits on top of the page content; the
+      // harness UI's own top-right controls are nudged down to clear it.
     }
+    // Drop the header-utilities nudge style (idempotent per document).
+    if (!document.getElementById('deepseek-harness-header-nudge')) {
+      document.head.appendChild(nudgeStyle)
+    }
+    // Initial caption-button color: match the page's actual background
+    // luminance (light page → dark icons, dark page → light icons).
+    const light = pageIsLight()
+    const fg = light ? '#57606a' : '#c9d1d9'
+    bar.querySelectorAll('.dsh-caption-btn').forEach((b) => {
+      b.style.color = fg
+    })
     if (lastStartup) applyStartup(lastStartup)
   }
   if (document.readyState === 'loading') {
